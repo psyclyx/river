@@ -3,6 +3,7 @@
 
 pub const c = @cImport({
     @cDefine("_POSIX_C_SOURCE", "200809L");
+    @cDefine("WLR_USE_UNSTABLE", "");
 
     @cInclude("stdlib.h");
     @cInclude("unistd.h");
@@ -11,4 +12,6 @@ pub const c = @cImport({
     @cInclude("libevdev/libevdev.h");
 
     @cInclude("libinput.h");
+
+    @cInclude("wlr/types/wlr_server_decoration.h");
 });
