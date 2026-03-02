@@ -174,6 +174,29 @@ pub fn build(b: *Build) !void {
             .flags = &.{ "-std=c99", "-O2" },
         });
 
+        // Generate color-management-v1 protocol header and compile C wrapper.
+        // The wrapper is needed because wlr_color_manager_v1_create takes a struct
+        // containing enum types from the generated protocol header.
+        {
+            var ret: u8 = undefined;
+            const wp_pkgdatadir = b.runAllowFail(
+                &.{ "pkg-config", "--variable=pkgdatadir", "wayland-protocols" },
+                &ret,
+                .Ignore,
+            ) catch @panic("wayland-protocols not found via pkg-config");
+            const wp_dir = mem.trim(u8, wp_pkgdatadir, &std.ascii.whitespace);
+
+            const gen_header = b.addSystemCommand(&.{ "wayland-scanner", "server-header" });
+            gen_header.addArg(b.fmt("{s}/staging/color-management/color-management-v1.xml", .{wp_dir}));
+            const color_mgmt_header = gen_header.addOutputFileArg("color-management-v1-protocol.h");
+
+            river.addCSourceFile(.{
+                .file = b.path("river/color_management_wrapper.c"),
+                .flags = &.{ "-std=c99", "-O2" },
+            });
+            river.addIncludePath(color_mgmt_header.dirname());
+        }
+
         river.pie = pie;
         river.root_module.omit_frame_pointer = omit_frame_pointer;
 
