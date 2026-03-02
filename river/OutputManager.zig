@@ -40,6 +40,8 @@ power_manager_set_mode: wl.Listener(*wlr.OutputPowerManagerV1.event.SetMode) = .
 
 gamma_control_manager: *wlr.GammaControlManagerV1,
 
+color_manager_global: ?*wl.Global = null,
+
 /// All Outputs that have a corresponding wlr_output.
 outputs: wl.list.Head(Output, .link),
 
@@ -50,6 +52,13 @@ pub fn init(om: *OutputManager) !void {
     const gamma_control_manager = try wlr.GammaControlManagerV1.create(server.wl_server);
     server.scene.wlr_scene.setGammaControlManagerV1(gamma_control_manager);
 
+    const color_manager = river_create_color_manager(@ptrCast(server.wl_server));
+    if (color_manager != null) {
+        log.info("wp_color_management_v1 global created", .{});
+    } else {
+        log.err("failed to create wp_color_management_v1", .{});
+    }
+
     om.* = .{
         .output_layout = output_layout,
         .outputs = undefined,
@@ -59,6 +68,7 @@ pub fn init(om: *OutputManager) !void {
         .wlr_output_manager = try wlr.OutputManagerV1.create(server.wl_server),
         .power_manager = try wlr.OutputPowerManagerV1.create(server.wl_server),
         .gamma_control_manager = gamma_control_manager,
+        .color_manager_global = if (color_manager) |cm| @ptrCast(river_color_manager_get_global(cm)) else null,
     };
 
     om.outputs.init();
@@ -442,3 +452,6 @@ fn sendConfig(om: *OutputManager) !void {
     // compared to the last config set.
     om.wlr_output_manager.setConfiguration(config);
 }
+
+extern fn river_create_color_manager(*anyopaque) ?*anyopaque;
+extern fn river_color_manager_get_global(*anyopaque) *anyopaque;

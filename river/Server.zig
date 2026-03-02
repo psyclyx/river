@@ -340,6 +340,9 @@ fn allowlist(server: *Server, global: *const wl.Global) bool {
 
 /// Returns true if the global is blocked for security contexts
 fn blocklist(server: *Server, global: *const wl.Global) bool {
+    if (server.om.color_manager_global) |color_global| {
+        if (global == color_global) return true;
+    }
     return global == server.security_context_manager.global or
         global == server.wm.global or
         global == server.layer_shell.global or

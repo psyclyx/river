@@ -244,9 +244,9 @@ fn loadIccProfile(name: [*:0]const u8) ?*wlr.ColorTransform {
     const data_home = posix.getenv("XDG_DATA_HOME");
     const home = posix.getenv("HOME");
     const icc_path = if (data_home) |dh|
-        fmt.allocPrintZ(util.gpa, "{s}/icc/{s}.icc", .{ dh, name }) catch return null
+        fmt.allocPrintSentinel(util.gpa, "{s}/icc/{s}.icc", .{ dh, name }, 0) catch return null
     else if (home) |h|
-        fmt.allocPrintZ(util.gpa, "{s}/.local/share/icc/{s}.icc", .{ h, name }) catch return null
+        fmt.allocPrintSentinel(util.gpa, "{s}/.local/share/icc/{s}.icc", .{ h, name }, 0) catch return null
     else
         return null;
     defer util.gpa.free(icc_path);
