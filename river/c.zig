@@ -14,4 +14,5 @@ pub const c = @cImport({
     @cInclude("libinput.h");
 
     @cInclude("wlr/types/wlr_server_decoration.h");
+    @cInclude("wlr/render/color.h");
 });
