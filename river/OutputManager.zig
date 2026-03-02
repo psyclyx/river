@@ -349,6 +349,7 @@ pub fn commitOutputState(om: *OutputManager) void {
         for (states.items) |*state| {
             const output: *Output = @ptrCast(@alignCast(state.output.data));
             if (!output.scene_output.?.buildState(&state.base, &.{
+                .color_transform = output.color_transform,
                 .swapchain = swapchain_manager.getSwapchain(state.output),
             })) {
                 log.err("failed to render scene for {s}", .{state.output.name});
