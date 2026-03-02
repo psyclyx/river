@@ -15,6 +15,7 @@ const wl = wayland.server.wl;
 const zwlr = wayland.server.zwlr;
 const river = wayland.server.river;
 
+const c = @import("c.zig").c;
 const server = &@import("main.zig").server;
 const util = @import("util.zig");
 
@@ -151,6 +152,9 @@ lock_render_state: enum {
     lock_surface,
 } = .blanked,
 
+/// Per-output ICC color transform loaded from $XDG_DATA_HOME/icc/<connector>.icc
+color_transform: ?*wlr.ColorTransform = null,
+
 /// Root.outputs
 link: wl.list.Link,
 
@@ -217,6 +221,8 @@ pub fn create(wlr_output: *wlr.Output) !void {
     wlr_output.events.frame.add(&output.frame);
     wlr_output.events.present.add(&output.present);
 
+    output.color_transform = loadIccProfile(wlr_output.name);
+
     output.scheduled.state = .enabled;
     if (wlr_output.preferredMode()) |preferred_mode| {
         output.scheduled.mode = .{ .standard = preferred_mode };
@@ -232,6 +238,42 @@ pub fn create(wlr_output: *wlr.Output) !void {
     }
 
     server.wm.dirtyWindowing();
+}
+
+fn loadIccProfile(name: [*:0]const u8) ?*wlr.ColorTransform {
+    const data_home = posix.getenv("XDG_DATA_HOME");
+    const home = posix.getenv("HOME");
+    const icc_path = if (data_home) |dh|
+        fmt.allocPrintZ(util.gpa, "{s}/icc/{s}.icc", .{ dh, name }) catch return null
+    else if (home) |h|
+        fmt.allocPrintZ(util.gpa, "{s}/.local/share/icc/{s}.icc", .{ h, name }) catch return null
+    else
+        return null;
+    defer util.gpa.free(icc_path);
+
+    const file = std.fs.openFileAbsoluteZ(icc_path, .{}) catch |err| {
+        switch (err) {
+            error.FileNotFound => log.info("no ICC profile at {s}", .{icc_path}),
+            else => log.warn("failed to open ICC profile {s}: {}", .{ icc_path, err }),
+        }
+        return null;
+    };
+    defer file.close();
+
+    const data = file.readToEndAlloc(util.gpa, 4 * 1024 * 1024) catch |err| {
+        log.err("failed to read ICC profile {s}: {}", .{ icc_path, err });
+        return null;
+    };
+    defer util.gpa.free(data);
+
+    const transform = c.wlr_color_transform_init_linear_to_icc(data.ptr, data.len);
+    if (transform) |tr| {
+        log.info("loaded ICC profile from {s}", .{icc_path});
+        return @ptrCast(tr);
+    } else {
+        log.err("failed to parse ICC profile {s}", .{icc_path});
+        return null;
+    }
 }
 
 fn handleDestroy(listener: *wl.Listener(*wlr.Output), wlr_output: *wlr.Output) void {
@@ -255,6 +297,11 @@ fn handleDestroy(listener: *wl.Listener(*wlr.Output), wlr_output: *wlr.Output) v
                 device.seat.cursor.wlr_cursor.mapInputToOutput(device.wlr_device, null);
             }
         }
+    }
+
+    if (output.color_transform) |ct| {
+        c.wlr_color_transform_unref(@ptrCast(ct));
+        output.color_transform = null;
     }
 
     output.destroy.link.remove();
@@ -438,7 +485,9 @@ fn renderAndCommit(output: *Output) !void {
 
     output.current.applyNoModeset(&state);
 
-    if (!output.scene_output.?.buildState(&state, null)) return error.CommitFailed;
+    if (!output.scene_output.?.buildState(&state, &.{
+        .color_transform = output.color_transform,
+    })) return error.CommitFailed;
 
     if (!wlr_output.commitState(&state)) return error.CommitFailed;
 
