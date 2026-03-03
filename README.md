@@ -114,6 +114,14 @@ For complete documentation see the `river(1)` man page.
 If my work on river adds value to your life and you'd like to support me
 financially you can find donation information [here](https://isaacfreund.com/donate/).
 
+## Fork changes
+
+This is a fork of [river](https://codeberg.org/river/river) with the following additions:
+
+- **KDE server decoration protocol** (`org_kde_kwin_server_decoration_manager`) — enables server-side window decorations by default
+
+These changes live on feature branches. The `main` branch tracks upstream.
+
 ## Licensing
 
 This project follows the [REUSE Specification](https://reuse.software/spec-3.3/),
