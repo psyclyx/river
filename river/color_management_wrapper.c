@@ -24,7 +24,7 @@ struct wlr_color_manager_v1 *river_create_color_manager(struct wl_display *displ
 	};
 	const struct wlr_color_manager_v1_options options = {
 		.features = {
-			.icc_v2_v4 = true,
+			.icc_v2_v4 = false, // not yet implemented in wlroots
 		},
 		.render_intents = render_intents,
 		.render_intents_len = sizeof(render_intents) / sizeof(render_intents[0]),
