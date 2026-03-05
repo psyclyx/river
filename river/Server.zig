@@ -63,6 +63,7 @@ cursor_shape_manager: *wlr.CursorShapeManagerV1,
 
 xdg_shell: *wlr.XdgShell,
 xdg_decoration_manager: *wlr.XdgDecorationManagerV1,
+server_decoration_manager_global: *wl.Global,
 xdg_activation: *wlr.XdgActivationV1,
 
 data_device_manager: *wlr.DataDeviceManager,
@@ -137,6 +138,7 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
 
         .xdg_shell = try wlr.XdgShell.create(wl_server, 5),
         .xdg_decoration_manager = try wlr.XdgDecorationManagerV1.create(wl_server),
+        .server_decoration_manager_global = undefined,
         .xdg_activation = try wlr.XdgActivationV1.create(wl_server),
 
         .data_device_manager = try wlr.DataDeviceManager.create(wl_server),
@@ -163,6 +165,16 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
         .xkb_bindings = undefined,
         .layer_shell = undefined,
     };
+
+    // Create the KDE server decoration manager (org_kde_kwin_server_decoration_manager).
+    // This tells clients like Firefox and Ghostty that prefer this protocol over
+    // xdg-decoration that server-side decorations are the default.
+    {
+        const mgr = c.wlr_server_decoration_manager_create(@ptrCast(wl_server)) orelse
+            @panic("failed to create server decoration manager");
+        c.wlr_server_decoration_manager_set_default_mode(mgr, c.WLR_SERVER_DECORATION_MANAGER_MODE_SERVER);
+        server.server_decoration_manager_global = @ptrCast(mgr[0].global);
+    }
 
     if (renderer.getTextureFormats(@intFromEnum(wlr.BufferCap.dmabuf)) != null) {
         server.linux_dmabuf = try wlr.LinuxDmabufV1.createWithRenderer(wl_server, 5, renderer);
@@ -312,6 +324,7 @@ fn allowlist(server: *Server, global: *const wl.Global) bool {
         global == server.cursor_shape_manager.global or
         global == server.xdg_shell.global or
         global == server.xdg_decoration_manager.global or
+        global == server.server_decoration_manager_global or
         global == server.xdg_activation.global or
         global == server.data_device_manager.global or
         global == server.primary_selection_manager.global or
