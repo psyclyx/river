@@ -78,8 +78,6 @@ fn create(wlr_seat: *wlr.Seat, wlr_tool: *wlr.TabletTool) error{OutOfMemory}!*Ta
 fn handleDestroy(listener: *wl.Listener(*wlr.TabletTool), _: *wlr.TabletTool) void {
     const tool: *TabletTool = @fieldParentPtr("destroy", listener);
 
-    tool.wp_tool.wlr_tool.data = null;
-
     tool.wlr_cursor.destroy();
 
     tool.destroy.link.remove();
@@ -203,7 +201,8 @@ pub fn proximity(tool: *TabletTool, tablet: *Tablet, event: *wlr.Tablet.event.Pr
 pub fn tip(tool: *TabletTool, tablet: *Tablet, event: *wlr.Tablet.event.Tip) void {
     switch (event.state) {
         .down => {
-            assert(!tool.wp_tool.is_down);
+            // There have been reports of libinput emitting inconsistent down/up events.
+            if (tool.wp_tool.is_down) return;
 
             tool.wp_tool.notifyDown();
 
@@ -221,7 +220,8 @@ pub fn tip(tool: *TabletTool, tablet: *Tablet, event: *wlr.Tablet.event.Tip) voi
             }
         },
         .up => {
-            assert(tool.wp_tool.is_down);
+            // There have been reports of libinput emitting inconsistent down/up events.
+            if (!tool.wp_tool.is_down) return;
 
             tool.wp_tool.notifyUp();
             tool.maybeExitDown(tablet);

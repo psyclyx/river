@@ -24,6 +24,9 @@ const XwaylandOverrideRedirect = @import("XwaylandOverrideRedirect.zig");
 
 const log = std.log.scoped(.output);
 
+/// The very first modeset is different in that if it fails we exit river.
+first_modeset: bool = true,
+
 new_output: wl.Listener(*wlr.Output) = .init(handleNewOutput),
 
 output_layout: *wlr.OutputLayout,
@@ -250,6 +253,7 @@ pub fn commitOutputState(om: *OutputManager) void {
         var it = wm.sent.outputs.iterator(.forward);
         while (it.next()) |output| {
             assert(output.sent.state != .destroying);
+            output.rendering_current = output.rendering_requested;
             // This may be null even when the state is not .destroying if the
             // output is destroyed between manage start and render finish.
             const wlr_output = output.wlr_output orelse continue;
@@ -260,6 +264,13 @@ pub fn commitOutputState(om: *OutputManager) void {
                         log.err("out of memory", .{});
                         continue; // Try again next time
                     };
+                    // Adding the output to the layout creates the wl_output global
+                    if (!output.sent_wl_output) {
+                        if (output.object) |output_v1| {
+                            output_v1.sendWlOutput(wlr_output.global.?.getName(output_v1.getClient()));
+                            output.sent_wl_output = true;
+                        }
+                    }
                     if (server.lock_manager.lockSurfaceFromOutput(output)) |lock_surface| {
                         lock_surface.tree.node.setPosition(output.sent.x, output.sent.y);
                     }
@@ -290,7 +301,8 @@ pub fn commitOutputState(om: *OutputManager) void {
                     if (mode.height != wlr_output.height) break :blk true;
                     if (mode.refresh != wlr_output.refresh) break :blk true;
                 },
-                .none => unreachable,
+                // This branch is reachable if we fail to enable an output.
+                .none => assert(output.sent.state == .disabled_hard),
             }
             // If an output newly exposed to river is already enabled, we
             // must modeset since the mode is otherwise undefined.
@@ -333,23 +345,7 @@ pub fn commitOutputState(om: *OutputManager) void {
 
         if (!swapchain_manager.prepare(states.items)) {
             log.err("failed to prepare new output configuration", .{});
-            // TODO search for a working fallback
-
-            if (wm.sent.output_config) |config| {
-                config.sendFailed();
-                config.destroy();
-                wm.sent.output_config = null;
-            }
-
-            {
-                // Revert to last working state on failure
-                var it = wm.sent.outputs.iterator(.forward);
-                while (it.next()) |output| {
-                    output.scheduled = output.current;
-                    output.sent = output.current;
-                }
-                wm.dirtyWindowing();
-            }
+            om.modesetFailed();
             return;
         }
 
@@ -364,24 +360,10 @@ pub fn commitOutputState(om: *OutputManager) void {
 
         if (!server.backend.commit(states.items)) {
             log.err("failed to commit new output configuration", .{});
-
-            if (wm.sent.output_config) |config| {
-                config.sendFailed();
-                config.destroy();
-                wm.sent.output_config = null;
-            }
-
-            {
-                // Revert to last working state on failure
-                var it = wm.sent.outputs.iterator(.forward);
-                while (it.next()) |output| {
-                    output.scheduled = output.current;
-                    output.sent = output.current;
-                }
-                wm.dirtyWindowing();
-            }
+            om.modesetFailed();
             return;
         }
+        om.first_modeset = false;
 
         swapchain_manager.apply();
     }
@@ -418,6 +400,35 @@ pub fn commitOutputState(om: *OutputManager) void {
     om.sendConfig() catch {
         log.err("out of memory", .{});
     };
+}
+
+fn modesetFailed(om: *OutputManager) void {
+    const wm = &server.wm;
+
+    // If the very first modeset fails, the user's hardware/drivers are
+    // probably not compatible with river. In this case, exit rather
+    // than running forever without rendering anything.
+    if (om.first_modeset) {
+        log.err("initial modeset failed, exiting river", .{});
+        server.wl_server.terminate();
+        return;
+    }
+
+    if (wm.sent.output_config) |config| {
+        config.sendFailed();
+        config.destroy();
+        wm.sent.output_config = null;
+    }
+
+    {
+        // Revert to last working state on failure
+        var it = wm.sent.outputs.iterator(.forward);
+        while (it.next()) |output| {
+            output.scheduled = output.current;
+            output.sent = output.current;
+        }
+        wm.dirtyWindowing();
+    }
 }
 
 /// Send the current output state to all wlr-output-manager clients.

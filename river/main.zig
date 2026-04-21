@@ -5,18 +5,21 @@ const build_options = @import("build_options");
 const std = @import("std");
 const mem = std.mem;
 const fs = std.fs;
-const io = std.io;
+const Io = std.Io;
 const log = std.log;
 const posix = std.posix;
+const exit = std.process.exit;
+
 const builtin = @import("builtin");
 const wlr = @import("wlroots");
 const flags = @import("flags");
 
-const c = @import("c.zig").c;
 const util = @import("util.zig");
 const process = @import("process.zig");
 
 const Server = @import("Server.zig");
+
+const io = Io.Threaded.global_single_threaded.io();
 
 const usage: []const u8 =
     \\usage: river [options]
@@ -29,37 +32,48 @@ const usage: []const u8 =
     \\
 ;
 
+const full_version = std.fmt.comptimePrint("{s} {c}xwayland", .{
+    build_options.version,
+    if (build_options.xwayland) '+' else '-',
+});
+
 pub var server: Server = undefined;
 
-pub fn main() anyerror!void {
-    const result = flags.parser([*:0]const u8, &.{
+pub fn main(init: std.process.Init.Minimal) anyerror!void {
+    var arena_alloc = std.heap.ArenaAllocator.init(util.gpa);
+    defer arena_alloc.deinit();
+    const arena = arena_alloc.allocator();
+
+    const args = try init.args.toSlice(arena);
+
+    const result = flags.parser(&.{
         .{ .name = "h", .kind = .boolean },
         .{ .name = "version", .kind = .boolean },
         .{ .name = "c", .kind = .arg },
         .{ .name = "log-level", .kind = .arg },
         .{ .name = "log-scopes", .kind = .arg },
         .{ .name = "no-xwayland", .kind = .boolean },
-    }).parse(std.os.argv[1..]) catch {
+    }).parse(args[1..]) catch {
         try stderr.writeAll(usage);
         try stderr.flush();
-        posix.exit(1);
+        exit(1);
     };
     if (result.flags.h) {
         try stdout.writeAll(usage);
         try stdout.flush();
-        posix.exit(0);
+        exit(0);
     }
     if (result.args.len != 0) {
         log.err("unknown option '{s}'", .{result.args[0]});
         try stderr.writeAll(usage);
         try stderr.flush();
-        posix.exit(1);
+        exit(1);
     }
 
     if (result.flags.version) {
-        try stdout.writeAll(build_options.version ++ "\n");
+        try stdout.writeAll(full_version ++ "\n");
         try stdout.flush();
-        posix.exit(0);
+        exit(0);
     }
     if (result.flags.@"log-level") |level| {
         if (mem.eql(u8, level, "error")) {
@@ -72,7 +86,7 @@ pub fn main() anyerror!void {
             runtime_log_level = .debug;
         } else {
             log.err("invalid log level '{s}'", .{level});
-            posix.exit(1);
+            exit(1);
         }
     }
     if (result.flags.@"log-scopes") |scopes| {
@@ -89,13 +103,13 @@ pub fn main() anyerror!void {
                 // former requires quoting in most shells.
                 const scope = std.meta.stringToEnum(LogScope, raw[1..]) orelse {
                     log.err("invalid log scope '{s}'", .{raw});
-                    posix.exit(1);
+                    exit(1);
                 };
                 log_scopes.remove(scope);
             } else {
                 const scope = std.meta.stringToEnum(LogScope, raw) orelse {
                     log.err("invalid log scope '{s}'", .{raw});
-                    posix.exit(1);
+                    exit(1);
                 };
                 log_scopes.insert(scope);
             }
@@ -106,11 +120,17 @@ pub fn main() anyerror!void {
         if (result.flags.c) |command| {
             break :blk try util.gpa.dupeZ(u8, command);
         } else {
-            break :blk try defaultInitPath();
+            break :blk try defaultInitPath(init.environ);
         }
     };
+    defer if (startup_command) |cmd| util.gpa.free(cmd);
 
-    log.info("river version {s}, initializing server", .{build_options.version});
+    try detectClassic(startup_command);
+
+    log.info("initializing river version {s}", .{full_version});
+    if (build_options.xwayland and !runtime_xwayland) {
+        log.info("Xwayland disabled at runtime with -no-xwayland", .{});
+    }
 
     river_init_wlroots_log(switch (runtime_log_level) {
         .debug => .debug,
@@ -131,17 +151,47 @@ pub fn main() anyerror!void {
 
     process.setup();
 
-    try server.start();
+    var buf: [11]u8 = undefined;
+    const socket = try server.wl_server.addSocketAuto(&buf);
+    try server.backend.start();
 
     // Run the child in a new process group so that we can send SIGTERM to all
     // descendants on exit.
     const child_pgid = if (startup_command) |cmd| blk: {
         log.info("running init executable '{s}'", .{cmd});
+
+        var env_map = try init.environ.createMap(util.gpa);
+        defer env_map.deinit();
+
+        try env_map.put("WAYLAND_DISPLAY", socket);
+
+        if (build_options.xwayland) {
+            if (server.xwayland) |xwayland| {
+                try env_map.put("DISPLAY", mem.sliceTo(xwayland.display_name, 0));
+            }
+        }
+
+        const env_block = try env_map.createPosixBlock(util.gpa, .{});
+        defer env_block.deinit(util.gpa);
+
         const child_args = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd, null };
-        const pid = try posix.fork();
+
+        const pid: posix.pid_t = fork: {
+            const rc = posix.system.fork();
+            switch (posix.errno(rc)) {
+                .SUCCESS => break :fork @intCast(rc),
+                .AGAIN => return error.SystemResources,
+                .NOMEM => return error.SystemResources,
+                .NOSYS => return error.OperationUnsupported,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        };
+
         if (pid == 0) {
             process.cleanupChild();
-            posix.execveZ("/bin/sh", &child_args, std.c.environ) catch c._exit(1);
+            if (posix.errno(posix.system.execve("/bin/sh", &child_args, env_block.slice.ptr)) != .SUCCESS) {
+                posix.system.exit(1);
+            }
         }
         util.gpa.free(cmd);
         // Since the child has called setsid, the pid is the pgid
@@ -154,26 +204,24 @@ pub fn main() anyerror!void {
     log.info("running server", .{});
 
     server.wl_server.run();
-
-    log.info("shutting down", .{});
 }
 
-fn defaultInitPath() !?[:0]const u8 {
+fn defaultInitPath(environ: std.process.Environ) !?[:0]const u8 {
     const path = blk: {
-        if (posix.getenv("XDG_CONFIG_HOME")) |xdg_config_home| {
+        if (environ.getPosix("XDG_CONFIG_HOME")) |xdg_config_home| {
             break :blk try fs.path.joinZ(util.gpa, &[_][]const u8{ xdg_config_home, "river/init" });
-        } else if (posix.getenv("HOME")) |home| {
+        } else if (environ.getPosix("HOME")) |home| {
             break :blk try fs.path.joinZ(util.gpa, &[_][]const u8{ home, ".config/river/init" });
         } else {
             return null;
         }
     };
 
-    posix.accessZ(path, posix.X_OK) catch |err| {
+    Io.Dir.cwd().access(io, path, .{ .execute = true }) catch |err| {
         if (err == error.PermissionDenied) {
-            if (posix.accessZ(path, posix.R_OK)) {
+            if (Io.Dir.cwd().access(io, path, .{})) {
                 log.err("failed to run init executable {s}: the file is not executable", .{path});
-                posix.exit(1);
+                exit(1);
             } else |_| {}
         }
         log.err("failed to run init executable {s}: {s}", .{ path, @errorName(err) });
@@ -184,12 +232,58 @@ fn defaultInitPath() !?[:0]const u8 {
     return path;
 }
 
+fn detectClassic(startup_command: ?[:0]const u8) !void {
+    const path = startup_command orelse return;
+    if (mem.indexOfScalar(u8, path, '/') == null) return;
+
+    const classic = grepRiverctl(path) catch |err| {
+        log.err("failed to detect riverctl usage in init file: {s}", .{@errorName(err)});
+        return;
+    };
+    if (classic) {
+        try stderr.print(
+            \\The init file {[path]s} contains the string "riverctl".
+            \\This river version ({[version]s}) does not support riverctl, you may
+            \\wish to install river-classic instead.
+            \\
+            \\River {[version]s} is a non-monolithic Wayland compositor and
+            \\requires a compatible window manager to be useful.
+            \\See https://isaacfreund.com/software/river for more information.
+            \\
+        , .{
+            .path = path,
+            .version = build_options.version,
+        });
+        try stderr.flush();
+        exit(1);
+    }
+}
+
+fn grepRiverctl(path: [:0]const u8) !bool {
+    var file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [1024]u8 = undefined;
+    var file_reader = file.reader(io, &buffer);
+    const reader = &file_reader.interface;
+    while (true) {
+        _ = try reader.discardDelimiterExclusive('r');
+        const bytes = reader.peekArray("riverctl".len) catch |err| switch (err) {
+            error.EndOfStream => return false,
+            else => |e| return e,
+        };
+        if (mem.eql(u8, bytes, "riverctl")) {
+            return true;
+        }
+        reader.toss(1);
+    }
+}
+
 var stderr_buffer: [1024]u8 = undefined;
-var stderr_writer = fs.File.stderr().writer(&stderr_buffer);
+var stderr_writer = Io.File.stderr().writer(io, &stderr_buffer);
 const stderr = &stderr_writer.interface;
 
 var stdout_buffer: [1024]u8 = undefined;
-var stdout_writer = fs.File.stdout().writer(&stdout_buffer);
+var stdout_writer = Io.File.stdout().writer(io, &stdout_buffer);
 const stdout = &stdout_writer.interface;
 
 // Scopes should be added to this list sparingly.

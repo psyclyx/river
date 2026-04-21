@@ -9,9 +9,10 @@ const assert = std.debug.assert;
 const mem = std.mem;
 const posix = std.posix;
 const wlr = @import("wlroots");
-const wl = @import("wayland").server.wl;
+const wayland = @import("wayland");
+const wl = wayland.server.wl;
+const wp = wayland.server.wp;
 
-const c = @import("c.zig").c;
 const util = @import("util.zig");
 
 const IdleInhibitManager = @import("IdleInhibitManager.zig");
@@ -23,6 +24,7 @@ const Scene = @import("Scene.zig");
 const SceneNodeData = @import("SceneNodeData.zig");
 const Seat = @import("Seat.zig");
 const TabletTool = @import("TabletTool.zig");
+const Window = @import("Window.zig");
 const WindowManager = @import("WindowManager.zig");
 const XkbBindings = @import("XkbBindings.zig");
 const LayerShell = @import("LayerShell.zig");
@@ -40,6 +42,8 @@ wl_server: *wl.Server,
 sigint_source: *wl.EventSource,
 sigterm_source: *wl.EventSource,
 
+fixes: *wlr.Fixes,
+
 backend: *wlr.Backend,
 session: ?*wlr.Session,
 
@@ -54,6 +58,9 @@ linux_dmabuf: ?*wlr.LinuxDmabufV1 = null,
 linux_drm_syncobj_manager: ?*wlr.LinuxDrmSyncobjManagerV1 = null,
 single_pixel_buffer_manager: *wlr.SinglePixelBufferManagerV1,
 alpha_modifier: *wlr.AlphaModifierV1,
+
+color_manager: ?*wlr.ColorManagerV1 = null,
+color_representation_manager: *wlr.ColorRepresentationManagerV1,
 
 viewporter: *wlr.Viewporter,
 fractional_scale_manager: *wlr.FractionalScaleManagerV1,
@@ -77,7 +84,11 @@ screencopy_manager: *wlr.ScreencopyManagerV1,
 image_copy_capture_manager: *wlr.ExtImageCopyCaptureManagerV1,
 output_image_capture_source_manager: *wlr.ExtOutputImageCaptureSourceManagerV1,
 
+wlr_foreign_toplevel_manager: *wlr.ForeignToplevelManagerV1,
 foreign_toplevel_list: *wlr.ExtForeignToplevelListV1,
+toplevel_capture_source_manager: *wlr.ExtForeignToplevelImageCaptureSourceManagerV1,
+
+tearing_control_manager: *wlr.TearingControlManagerV1,
 
 scene: Scene,
 input_manager: InputManager,
@@ -99,6 +110,7 @@ new_xdg_toplevel: wl.Listener(*wlr.XdgToplevel) = .init(handleNewXdgToplevel),
 new_toplevel_decoration: wl.Listener(*wlr.XdgToplevelDecorationV1) = .init(handleNewToplevelDecoration),
 request_activate: wl.Listener(*wlr.XdgActivationV1.event.RequestActivate) = .init(handleRequestActivate),
 request_set_cursor_shape: wl.Listener(*wlr.CursorShapeManagerV1.event.RequestSetShape) = .init(handleRequestSetCursorShape),
+toplevel_capture_request: wl.Listener(*wlr.ExtForeignToplevelImageCaptureSourceManagerV1.Request) = .init(handleToplevelCaptureRequest),
 
 pub fn init(server: *Server, runtime_xwayland: bool) !void {
     // We intentionally don't try to prevent memory leaks on error in this function
@@ -116,8 +128,10 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
 
     server.* = .{
         .wl_server = wl_server,
-        .sigint_source = try loop.addSignal(*wl.Server, posix.SIG.INT, terminate, wl_server),
-        .sigterm_source = try loop.addSignal(*wl.Server, posix.SIG.TERM, terminate, wl_server),
+        .sigint_source = try loop.addSignal(*wl.Server, @intFromEnum(posix.SIG.INT), terminate, wl_server),
+        .sigterm_source = try loop.addSignal(*wl.Server, @intFromEnum(posix.SIG.TERM), terminate, wl_server),
+
+        .fixes = try wlr.Fixes.create(wl_server, 1),
 
         .backend = backend,
         .session = session,
@@ -130,11 +144,13 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
         .single_pixel_buffer_manager = try wlr.SinglePixelBufferManagerV1.create(wl_server),
         .alpha_modifier = try wlr.AlphaModifierV1.create(wl_server),
 
+        .color_representation_manager = try wlr.ColorRepresentationManagerV1.createWithRenderer(wl_server, 1, renderer),
+
         .viewporter = try wlr.Viewporter.create(wl_server),
         .fractional_scale_manager = try wlr.FractionalScaleManagerV1.create(wl_server, 1),
         .compositor = compositor,
         .subcompositor = try wlr.Subcompositor.create(wl_server),
-        .cursor_shape_manager = try wlr.CursorShapeManagerV1.create(server.wl_server, 1),
+        .cursor_shape_manager = try wlr.CursorShapeManagerV1.create(server.wl_server, 2),
 
         .xdg_shell = try wlr.XdgShell.create(wl_server, 5),
         .xdg_decoration_manager = try wlr.XdgDecorationManagerV1.create(wl_server),
@@ -152,7 +168,11 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
         .image_copy_capture_manager = try wlr.ExtImageCopyCaptureManagerV1.create(wl_server, 1),
         .output_image_capture_source_manager = try wlr.ExtOutputImageCaptureSourceManagerV1.create(wl_server, 1),
 
+        .wlr_foreign_toplevel_manager = try wlr.ForeignToplevelManagerV1.create(wl_server),
         .foreign_toplevel_list = try wlr.ExtForeignToplevelListV1.create(wl_server, 1),
+        .toplevel_capture_source_manager = try wlr.ExtForeignToplevelImageCaptureSourceManagerV1.create(wl_server, 1),
+
+        .tearing_control_manager = try wlr.TearingControlManagerV1.create(wl_server, 1),
 
         .scene = undefined,
         .om = undefined,
@@ -186,6 +206,23 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
         }
     }
 
+    if (renderer.features.input_color_transform) {
+        const render_intents: []const wp.ColorManagerV1.RenderIntent = &.{.perceptual};
+        const transfer_functions = renderer.transferFunctionList();
+        defer std.c.free(transfer_functions.ptr);
+        const primaries = renderer.primariesList();
+        defer std.c.free(primaries.ptr);
+        server.color_manager = try wlr.ColorManagerV1.create(wl_server, 2, .{
+            .features = .{
+                .parametric = true,
+                .set_mastering_display_primaries = true,
+            },
+            .render_intents = render_intents,
+            .transfer_functions = transfer_functions,
+            .primaries = primaries,
+        });
+    }
+
     if (build_options.xwayland and runtime_xwayland) {
         server.xwayland = try wlr.Xwayland.create(wl_server, compositor, false);
         server.xwayland.?.events.new_surface.add(&server.new_xsurface);
@@ -207,6 +244,7 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
     server.xdg_decoration_manager.events.new_toplevel_decoration.add(&server.new_toplevel_decoration);
     server.xdg_activation.events.request_activate.add(&server.request_activate);
     server.cursor_shape_manager.events.request_set_shape.add(&server.request_set_cursor_shape);
+    server.toplevel_capture_source_manager.events.new_request.add(&server.toplevel_capture_request);
 
     wl_server.setGlobalFilter(*Server, globalFilter, server);
 }
@@ -221,6 +259,7 @@ pub fn deinit(server: *Server) void {
     server.new_toplevel_decoration.link.remove();
     server.request_activate.link.remove();
     server.request_set_cursor_shape.link.remove();
+    server.toplevel_capture_request.link.remove();
 
     server.input_manager.new_input.link.remove();
     server.om.new_output.link.remove();
@@ -251,20 +290,6 @@ pub fn deinit(server: *Server) void {
     server.layer_shell.deinit();
 
     server.wl_server.destroy();
-}
-
-/// Create the socket, start the backend, and setup the environment
-pub fn start(server: Server) !void {
-    var buf: [11]u8 = undefined;
-    const socket = try server.wl_server.addSocketAuto(&buf);
-    try server.backend.start();
-    // TODO: don't use libc's setenv
-    if (c.setenv("WAYLAND_DISPLAY", socket.ptr, 1) < 0) return error.SetenvError;
-    if (build_options.xwayland) {
-        if (server.xwayland) |xwayland| {
-            if (c.setenv("DISPLAY", xwayland.display_name, 1) < 0) return error.SetenvError;
-        }
-    }
 }
 
 fn globalFilter(client: *const wl.Client, global: *const wl.Global, server: *Server) bool {
@@ -300,6 +325,9 @@ fn allowlist(server: *Server, global: *const wl.Global) bool {
     if (server.linux_drm_syncobj_manager) |linux_drm_syncobj_manager| {
         if (global == linux_drm_syncobj_manager.global) return true;
     }
+    if (server.color_manager) |color_manager| {
+        if (global == color_manager.global) return true;
+    }
 
     // We must use the getInterface() approach for dynamically created globals
     // such as wl_output and wl_seat since the wl_global_create() function will
@@ -314,9 +342,11 @@ fn allowlist(server: *Server, global: *const wl.Global) bool {
     // For other globals I like the current pointer comparison approach as it
     // should catch river accidentally exposing multiple copies of e.g. wl_shm
     // with an assertion failure.
-    return global == server.shm.global or
+    return global == server.fixes.global or
+        global == server.shm.global or
         global == server.single_pixel_buffer_manager.global or
         global == server.alpha_modifier.global or
+        global == server.color_representation_manager.global or
         global == server.viewporter.global or
         global == server.fractional_scale_manager.global or
         global == server.compositor.global or
@@ -328,6 +358,7 @@ fn allowlist(server: *Server, global: *const wl.Global) bool {
         global == server.xdg_activation.global or
         global == server.data_device_manager.global or
         global == server.primary_selection_manager.global or
+        global == server.tearing_control_manager.global or
         global == server.om.presentation.global or
         global == server.om.xdg_output_manager.global or
         global == server.input_manager.relative_pointer_manager.global or
@@ -348,7 +379,9 @@ fn blocklist(server: *Server, global: *const wl.Global) bool {
         global == server.screencopy_manager.global or
         global == server.image_copy_capture_manager.global or
         global == server.output_image_capture_source_manager.global or
+        global == server.wlr_foreign_toplevel_manager.global or
         global == server.foreign_toplevel_list.global or
+        global == server.toplevel_capture_source_manager.global or
         global == server.export_dmabuf_manager.global or
         global == server.data_control_manager.global or
         global == server.wlr_data_control_manager.global or
@@ -472,7 +505,7 @@ fn handleRequestActivate(
 ) void {
     const node_data = SceneNodeData.fromSurface(event.surface) orelse return;
     switch (node_data.data) {
-        .window => |_| {}, // TODO support xdg-activation with a rwm extension protocol
+        .window => {}, // TODO support xdg-activation with a rwm extension protocol
         else => |tag| {
             log.info("ignoring xdg-activation-v1 activate request of {s} surface", .{@tagName(tag)});
         },
@@ -480,30 +513,58 @@ fn handleRequestActivate(
 }
 
 fn handleRequestSetCursorShape(
-    _: *wl.Listener(*wlr.CursorShapeManagerV1.event.RequestSetShape),
+    listener: *wl.Listener(*wlr.CursorShapeManagerV1.event.RequestSetShape),
     event: *wlr.CursorShapeManagerV1.event.RequestSetShape,
 ) void {
+    const server: *Server = @fieldParentPtr("request_set_cursor_shape", listener);
     const seat: *Seat = @ptrCast(@alignCast(event.seat_client.seat.data));
+
+    const name = wlr.CursorShapeManagerV1.shapeName(event.shape);
 
     if (event.tablet_tool) |wp_tool| {
         assert(event.device_type == .tablet_tool);
 
         const tool = TabletTool.get(event.seat_client.seat, wp_tool.wlr_tool) catch return;
-
         if (tool.allowSetCursor(event.seat_client, event.serial)) {
-            const name = wlr.CursorShapeManagerV1.shapeName(event.shape);
             tool.wlr_cursor.setXcursor(seat.cursor.xcursor_manager, name);
         }
     } else {
         assert(event.device_type == .pointer);
 
+        // Only the client with pointer focus is allowed to set the cursor
         const focused_client = event.seat_client.seat.pointer_state.focused_client;
-
-        // This can be sent by any client, so we check to make sure this one is
-        // actually has pointer focus first.
-        if (focused_client == event.seat_client) {
-            const name = wlr.CursorShapeManagerV1.shapeName(event.shape);
-            seat.cursor.setXcursor(name);
+        if (event.seat_client == focused_client) {
+            seat.cursor.setImage(.{ .xcursor = name });
+        }
+        // Except for the window manager client
+        if (server.wm.object) |object| {
+            if (event.seat_client.client == object.getClient() and
+                object.getVersion() >= 4)
+            {
+                seat.cursor.setWmImage(.{ .xcursor = name });
+            }
         }
     }
+}
+
+fn handleToplevelCaptureRequest(
+    listener: *wl.Listener(*wlr.ExtForeignToplevelImageCaptureSourceManagerV1.Request),
+    request: *wlr.ExtForeignToplevelImageCaptureSourceManagerV1.Request,
+) void {
+    const server: *Server = @fieldParentPtr("toplevel_capture_request", listener);
+    const window = @as(?*Window, @ptrCast(@alignCast(request.toplevel_handle.data))) orelse return;
+
+    const capture_source = window.capture_source orelse wlr.ExtImageCaptureSourceV1.createWithSceneNode(
+        &window.capture_scene.tree.node,
+        server.wl_server.getEventLoop(),
+        server.allocator,
+        server.renderer,
+    ) catch {
+        log.err("failed to create ext image capture source", .{});
+        return;
+    };
+
+    window.capture_source = capture_source;
+
+    _ = request.accept(capture_source);
 }

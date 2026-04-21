@@ -84,6 +84,7 @@ pub fn create(wlr_toplevel: *wlr.XdgToplevel) error{OutOfMemory}!void {
     errdefer toplevel.unmap.link.remove();
 
     _ = try window.surfaces.tree.createSceneXdgSurface(wlr_toplevel.base);
+    _ = try window.capture_scene.tree.createSceneXdgSurface(wlr_toplevel.base);
 
     toplevel.window = window;
 
@@ -120,6 +121,7 @@ pub fn configure(toplevel: *XdgToplevel) bool {
     };
 
     const scheduled = &toplevel.window.configure_scheduled;
+    const sent = &toplevel.window.configure_scheduled;
 
     if (!toplevel.needsConfigure()) {
         // If no new configure is required, continue to track a timed out configure
@@ -159,6 +161,11 @@ pub fn configure(toplevel: *XdgToplevel) bool {
     if (toplevel.decoration) |decoration| {
         _ = decoration.wlr_decoration.setMode(if (scheduled.ssd) .server_side else .client_side);
     }
+    if (scheduled.bounds.width != sent.bounds.width or
+        scheduled.bounds.height != sent.bounds.height)
+    {
+        _ = wlr_toplevel.setBounds(scheduled.bounds.width, scheduled.bounds.height);
+    }
 
     const width: u31 = scheduled.width orelse switch (toplevel.configure_state) {
         .idle => @intCast(toplevel.geometry.width),
@@ -182,7 +189,8 @@ pub fn configure(toplevel: *XdgToplevel) bool {
     // change in size involved. If the configure state is not idle, we are
     // currently tracking a timed out configure and should instead track the
     // new one even if there is no change in size involved.
-    if (width == toplevel.geometry.width and height == toplevel.geometry.height and
+    if (width != 0 and height != 0 and
+        width == toplevel.geometry.width and height == toplevel.geometry.height and
         toplevel.configure_state == .idle)
     {
         return false;
@@ -201,6 +209,8 @@ fn needsConfigure(toplevel: *XdgToplevel) bool {
 
     if (scheduled.width != null and scheduled.width != sent.width) return true;
     if (scheduled.height != null and scheduled.height != sent.height) return true;
+    if (scheduled.bounds.width != sent.bounds.width or
+        scheduled.bounds.height != sent.bounds.height) return true;
     if (scheduled.activated != sent.activated) return true;
     if (scheduled.ssd != sent.ssd) return true;
     if (!std.meta.eql(scheduled.tiled, sent.tiled)) return true;
@@ -280,7 +290,12 @@ fn handleUnmap(listener: *wl.Listener(void)) void {
 fn handleNewPopup(listener: *wl.Listener(*wlr.XdgPopup), wlr_xdg_popup: *wlr.XdgPopup) void {
     const toplevel: *XdgToplevel = @fieldParentPtr("new_popup", listener);
 
-    XdgPopup.create(wlr_xdg_popup, toplevel.window.popup_tree, toplevel.window.popup_tree) catch {
+    XdgPopup.create(
+        wlr_xdg_popup,
+        toplevel.window.popup_tree,
+        toplevel.window.popup_tree,
+        &toplevel.window.capture_scene.tree,
+    ) catch {
         wlr_xdg_popup.resource.postNoMemory();
         return;
     };

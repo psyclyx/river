@@ -65,6 +65,19 @@ const Mode = union(enum) {
 
 const default_size = 24;
 
+const Image = union(enum) {
+    /// No cursor image
+    none,
+    /// Name of the current Xcursor shape
+    xcursor: [*:0]const u8,
+    /// Cursor surface configured by the client
+    client: struct {
+        surface: *wlr.Surface,
+        hotspot_x: i32,
+        hotspot_y: i32,
+    },
+};
+
 const LayoutPoint = struct {
     lx: f64,
     ly: f64,
@@ -78,9 +91,12 @@ wlr_cursor: *wlr.Cursor,
 
 /// Xcursor manager for the currently configured Xcursor theme.
 xcursor_manager: *wlr.XcursorManager,
-/// Name of the current Xcursor shape, or null if a client has configured a
-/// surface to be used as the cursor shape instead.
-xcursor_name: ?[*:0]const u8 = null,
+/// The currently rendered cursor image
+image: Image = .none,
+image_surface_destroy: wl.Listener(*wlr.Surface) = .init(handleImageSurfaceDestroy),
+/// The most recent cursor image set by the window manager client
+wm_image: Image = .{ .xcursor = "default" },
+wm_image_surface_destroy: wl.Listener(*wlr.Surface) = .init(handleWmImageSurfaceDestroy),
 
 /// The set of currently pressed pointer buttons and the corresponding pointer mapping if any.
 pressed: std.AutoHashMapUnmanaged(u32, ?*PointerBinding) = .{},
@@ -109,6 +125,9 @@ swipe_end: wl.Listener(*wlr.Pointer.event.SwipeEnd) = .init(queueSwipeEnd),
 pinch_begin: wl.Listener(*wlr.Pointer.event.PinchBegin) = .init(queuePinchBegin),
 pinch_update: wl.Listener(*wlr.Pointer.event.PinchUpdate) = .init(queuePinchUpdate),
 pinch_end: wl.Listener(*wlr.Pointer.event.PinchEnd) = .init(queuePinchEnd),
+
+hold_begin: wl.Listener(*wlr.Pointer.event.HoldBegin) = .init(queueHoldBegin),
+hold_end: wl.Listener(*wlr.Pointer.event.HoldEnd) = .init(queueHoldEnd),
 
 touch_down: wl.Listener(*wlr.Touch.event.Down) = .init(handleTouchDown),
 touch_motion: wl.Listener(*wlr.Touch.event.Motion) = .init(handleTouchMotion),
@@ -155,6 +174,9 @@ pub fn init(cursor: *Cursor, seat: *Seat) !void {
     wlr_cursor.events.pinch_update.add(&cursor.pinch_update);
     wlr_cursor.events.pinch_end.add(&cursor.pinch_end);
 
+    wlr_cursor.events.hold_begin.add(&cursor.hold_begin);
+    wlr_cursor.events.hold_end.add(&cursor.hold_end);
+
     wlr_cursor.events.touch_down.add(&cursor.touch_down);
     wlr_cursor.events.touch_motion.add(&cursor.touch_motion);
     wlr_cursor.events.touch_up.add(&cursor.touch_up);
@@ -179,6 +201,8 @@ pub fn deinit(cursor: *Cursor) void {
     cursor.pinch_begin.link.remove();
     cursor.pinch_update.link.remove();
     cursor.pinch_end.link.remove();
+    cursor.hold_begin.link.remove();
+    cursor.hold_end.link.remove();
     cursor.request_set_cursor.link.remove();
 
     cursor.touch_down.link.remove();
@@ -216,10 +240,7 @@ pub fn setTheme(cursor: *Cursor, theme: ?[*:0]const u8, _size: ?u32) !void {
                 const wlr_xcursor = xcursor_manager.getXcursor("default", 1).?;
                 const image = wlr_xcursor.images[0];
                 xwayland.setCursor(
-                    image.buffer,
-                    image.width * 4,
-                    image.width,
-                    image.height,
+                    image.getBuffer(),
                     @intCast(image.hotspot_x),
                     @intCast(image.hotspot_y),
                 );
@@ -231,39 +252,94 @@ pub fn setTheme(cursor: *Cursor, theme: ?[*:0]const u8, _size: ?u32) !void {
     cursor.xcursor_manager.destroy();
     cursor.xcursor_manager = xcursor_manager;
 
-    if (cursor.xcursor_name) |name| {
-        cursor.setXcursor(name);
+    switch (cursor.image) {
+        .none, .client => {},
+        .xcursor => |name| cursor.wlr_cursor.setXcursor(xcursor_manager, name),
     }
 }
 
-pub fn setXcursor(cursor: *Cursor, name: [*:0]const u8) void {
-    cursor.wlr_cursor.setXcursor(cursor.xcursor_manager, name);
-    cursor.xcursor_name = name;
+pub fn setImage(cursor: *Cursor, image: Image) void {
+    if (cursor.image == .client) {
+        cursor.image_surface_destroy.link.remove();
+    }
+    cursor.image = image;
+    switch (cursor.image) {
+        .none => cursor.wlr_cursor.unsetImage(),
+        .xcursor => |name| cursor.wlr_cursor.setXcursor(cursor.xcursor_manager, name),
+        .client => |client| {
+            client.surface.events.destroy.add(&cursor.image_surface_destroy);
+            cursor.wlr_cursor.setSurface(client.surface, client.hotspot_x, client.hotspot_y);
+        },
+    }
+}
+
+fn handleImageSurfaceDestroy(listener: *wl.Listener(*wlr.Surface), _: *wlr.Surface) void {
+    const cursor: *Cursor = @fieldParentPtr("image_surface_destroy", listener);
+    // wlroots calls wlr_cursor_unset_image() automatically
+    // when the cursor surface is destroyed.
+    cursor.image = .none;
+    cursor.image_surface_destroy.link.remove();
+}
+
+pub fn setWmImage(cursor: *Cursor, wm_image: Image) void {
+    if (cursor.wm_image == .client) {
+        cursor.wm_image_surface_destroy.link.remove();
+    }
+    cursor.wm_image = wm_image;
+    if (cursor.wm_image == .client) {
+        cursor.wm_image.client.surface.events.destroy.add(&cursor.wm_image_surface_destroy);
+    }
+    if (cursor.seat.wlr_seat.pointer_state.focused_client == null) {
+        cursor.setImage(wm_image);
+    }
+}
+
+fn handleWmImageSurfaceDestroy(listener: *wl.Listener(*wlr.Surface), _: *wlr.Surface) void {
+    const cursor: *Cursor = @fieldParentPtr("wm_image_surface_destroy", listener);
+    cursor.wm_image = .none;
+    cursor.wm_image_surface_destroy.link.remove();
 }
 
 fn handleRequestSetCursor(
     listener: *wl.Listener(*wlr.Seat.event.RequestSetCursor),
     event: *wlr.Seat.event.RequestSetCursor,
 ) void {
-    // This event is rasied by the seat when a client provides a cursor image
     const cursor: *Cursor = @fieldParentPtr("request_set_cursor", listener);
     const focused_client = cursor.seat.wlr_seat.pointer_state.focused_client;
 
-    // This can be sent by any client, so we check to make sure this one is
-    // actually has pointer focus first.
-    if (focused_client == event.seat_client) {
-        // Once we've vetted the client, we can tell the cursor to use the
-        // provided surface as the cursor image. It will set the hardware cursor
-        // on the output that it's currently on and continue to do so as the
-        // cursor moves between outputs.
+    // Only the client with pointer focus is allowed to set the cursor
+    if (event.seat_client == focused_client) {
         log.debug("focused client set cursor", .{});
-        cursor.wlr_cursor.setSurface(event.surface, event.hotspot_x, event.hotspot_y);
-        cursor.xcursor_name = null;
+        if (event.surface) |surface| {
+            cursor.setImage(.{ .client = .{
+                .surface = surface,
+                .hotspot_x = event.hotspot_x,
+                .hotspot_y = event.hotspot_y,
+            } });
+        } else {
+            cursor.setImage(.none);
+        }
+    }
+    // Except for the window manager client
+    if (server.wm.object) |object| {
+        if (event.seat_client.client == object.getClient() and
+            object.getVersion() >= 4)
+        {
+            if (event.surface) |surface| {
+                cursor.setWmImage(.{ .client = .{
+                    .surface = surface,
+                    .hotspot_x = event.hotspot_x,
+                    .hotspot_y = event.hotspot_y,
+                } });
+            } else {
+                cursor.setWmImage(.none);
+            }
+        }
     }
 }
 
 fn clearFocus(cursor: *Cursor) void {
-    cursor.setXcursor("default");
+    cursor.setImage(cursor.wm_image);
     cursor.seat.wlr_seat.pointerNotifyClearFocus();
 }
 
@@ -289,7 +365,7 @@ pub fn opEndPointer(cursor: *Cursor) void {
     }
 }
 
-pub fn processMotionRelative(cursor: *Cursor, event: *const wlr.Pointer.event.Motion) void {
+pub fn processMotionRelative(cursor: *Cursor, event: *const Seat.Event.PointerMotionRelative) void {
     server.input_manager.relative_pointer_manager.sendRelativeMotion(
         cursor.seat.wlr_seat,
         @as(u64, event.time_msec) * 1000,
@@ -313,7 +389,7 @@ pub fn processMotionRelative(cursor: *Cursor, event: *const wlr.Pointer.event.Mo
 
     switch (cursor.mode) {
         .passthrough, .drag, .ignore, .down => {
-            cursor.wlr_cursor.move(event.device, dx, dy);
+            cursor.move(&event.mapping, dx, dy);
 
             switch (cursor.mode) {
                 .passthrough, .drag => {
@@ -343,10 +419,19 @@ pub fn processMotionRelative(cursor: *Cursor, event: *const wlr.Pointer.event.Mo
             data.delta_x = dx - @trunc(dx);
             data.delta_y = dy - @trunc(dy);
 
-            cursor.wlr_cursor.move(event.device, dx, dy);
+            cursor.move(&event.mapping, dx, dy);
             cursor.seat.opUpdate(@intFromFloat(cursor.wlr_cursor.x), @intFromFloat(cursor.wlr_cursor.y));
         },
     }
+}
+
+fn move(cursor: *const Cursor, mapping: *const wlr.Box, dx: f64, dy: f64) void {
+    var lx: f64 = cursor.wlr_cursor.x + dx;
+    var ly: f64 = cursor.wlr_cursor.y + dy;
+    if (!mapping.empty()) {
+        mapping.closestPoint(lx, ly, &lx, &ly);
+    }
+    cursor.wlr_cursor.warpClosest(null, lx, ly);
 }
 
 fn updateHovered(cursor: *Cursor) void {
@@ -387,15 +472,17 @@ fn updateHovered(cursor: *Cursor) void {
     }
 }
 
-pub fn processMotionAbsolute(cursor: *Cursor, event: *const wlr.Pointer.event.MotionAbsolute) void {
-    var lx: f64 = undefined;
-    var ly: f64 = undefined;
-    cursor.wlr_cursor.absoluteToLayoutCoords(event.device, event.x, event.y, &lx, &ly);
-
+pub fn processMotionAbsolute(cursor: *Cursor, event: *const Seat.Event.PointerMotionAbsolute) void {
+    var mapping = event.mapping;
+    if (mapping.empty()) {
+        server.om.output_layout.getBox(null, &mapping);
+    }
+    const lx = @as(f64, @floatFromInt(mapping.x)) + @as(f64, @floatFromInt(mapping.width)) * event.x;
+    const ly = @as(f64, @floatFromInt(mapping.y)) + @as(f64, @floatFromInt(mapping.height)) * event.y;
     const dx = lx - cursor.wlr_cursor.x;
     const dy = ly - cursor.wlr_cursor.y;
     cursor.processMotionRelative(&.{
-        .device = event.device,
+        .mapping = event.mapping,
         .time_msec = event.time_msec,
         .delta_x = dx,
         .delta_y = dy,
@@ -404,7 +491,7 @@ pub fn processMotionAbsolute(cursor: *Cursor, event: *const wlr.Pointer.event.Mo
     });
 }
 
-pub fn processButton(cursor: *Cursor, event: *const wlr.Pointer.event.Button) void {
+pub fn processButton(cursor: *Cursor, event: *const Seat.Event.PointerButton) void {
     if (event.state == .pressed) {
         const result = cursor.pressed.getOrPut(util.gpa, event.button) catch {
             log.err("out of memory", .{});
@@ -509,13 +596,12 @@ pub fn processButton(cursor: *Cursor, event: *const wlr.Pointer.event.Button) vo
     }
 }
 
-pub fn processAxis(cursor: *Cursor, event: *const wlr.Pointer.event.Axis) void {
-    const device: *InputDevice = @ptrCast(@alignCast(event.device.data));
+pub fn processAxis(cursor: *Cursor, event: *const Seat.Event.PointerAxis) void {
     cursor.seat.wlr_seat.pointerNotifyAxis(
         event.time_msec,
         event.orientation,
-        event.delta * device.config.scroll_factor,
-        math.lossyCast(i32, @as(f64, @floatFromInt(event.delta_discrete)) * device.config.scroll_factor),
+        event.delta,
+        event.delta_discrete,
         event.source,
         event.relative_direction,
     );
@@ -705,15 +791,7 @@ pub fn updateState(cursor: *Cursor) void {
     switch (cursor.mode) {
         .passthrough, .drag => {
             cursor.updateHovered();
-            const now = posix.clock_gettime(.MONOTONIC) catch @panic("CLOCK_MONOTONIC not supported");
-            // 2^32-1 milliseconds is ~50 days, which is a realistic uptime.
-            // This means that we must wrap if the monotonic time is greater than
-            // 2^32-1 milliseconds and hope that clients don't get too confused.
-            const msec: u32 = @intCast(@rem(
-                now.sec *% std.time.ms_per_s +% @divTrunc(now.nsec, std.time.ns_per_ms),
-                math.maxInt(u32),
-            ));
-            cursor.passthrough(msec);
+            cursor.passthrough(util.msecTimestamp());
         },
         .ignore, .down, .op => {},
     }
@@ -753,22 +831,48 @@ fn updateDragIcons(cursor: *Cursor) void {
 
 fn queueMotionRelative(listener: *wl.Listener(*wlr.Pointer.event.Motion), event: *wlr.Pointer.event.Motion) void {
     const cursor: *Cursor = @fieldParentPtr("motion_relative", listener);
-    cursor.seat.queueEvent(.{ .pointer_motion_relative = event.* }) catch {};
+    const device: *InputDevice = @ptrCast(@alignCast(event.device.data));
+    cursor.seat.queueEvent(.{ .pointer_motion_relative = .{
+        .mapping = device.activeMapping(),
+        .time_msec = event.time_msec,
+        .delta_x = event.delta_x,
+        .delta_y = event.delta_y,
+        .unaccel_dx = event.unaccel_dx,
+        .unaccel_dy = event.unaccel_dy,
+    } }) catch {};
 }
 
 fn queueMotionAbsolute(listener: *wl.Listener(*wlr.Pointer.event.MotionAbsolute), event: *wlr.Pointer.event.MotionAbsolute) void {
     const cursor: *Cursor = @fieldParentPtr("motion_absolute", listener);
-    cursor.seat.queueEvent(.{ .pointer_motion_absolute = event.* }) catch {};
+    const device: *InputDevice = @ptrCast(@alignCast(event.device.data));
+    cursor.seat.queueEvent(.{ .pointer_motion_absolute = .{
+        .mapping = device.activeMapping(),
+        .time_msec = event.time_msec,
+        .x = event.x,
+        .y = event.y,
+    } }) catch {};
 }
 
 fn queueButton(listener: *wl.Listener(*wlr.Pointer.event.Button), event: *wlr.Pointer.event.Button) void {
     const cursor: *Cursor = @fieldParentPtr("button", listener);
-    cursor.seat.queueEvent(.{ .pointer_button = event.* }) catch {};
+    cursor.seat.queueEvent(.{ .pointer_button = .{
+        .time_msec = event.time_msec,
+        .button = event.button,
+        .state = event.state,
+    } }) catch {};
 }
 
 fn queueAxis(listener: *wl.Listener(*wlr.Pointer.event.Axis), event: *wlr.Pointer.event.Axis) void {
     const cursor: *Cursor = @fieldParentPtr("axis", listener);
-    cursor.seat.queueEvent(.{ .pointer_axis = event.* }) catch {};
+    const device: *InputDevice = @ptrCast(@alignCast(event.device.data));
+    cursor.seat.queueEvent(.{ .pointer_axis = .{
+        .time_msec = event.time_msec,
+        .source = event.source,
+        .orientation = event.orientation,
+        .relative_direction = event.relative_direction,
+        .delta = event.delta * device.config.scroll_factor,
+        .delta_discrete = math.lossyCast(i32, @as(f64, @floatFromInt(event.delta_discrete)) * device.config.scroll_factor),
+    } }) catch {};
 }
 
 fn queueFrame(listener: *wl.Listener(*wlr.Cursor), _: *wlr.Cursor) void {
@@ -778,30 +882,70 @@ fn queueFrame(listener: *wl.Listener(*wlr.Cursor), _: *wlr.Cursor) void {
 
 fn queuePinchBegin(listener: *wl.Listener(*wlr.Pointer.event.PinchBegin), event: *wlr.Pointer.event.PinchBegin) void {
     const cursor: *Cursor = @fieldParentPtr("pinch_begin", listener);
-    cursor.seat.queueEvent(.{ .pointer_pinch_begin = event.* }) catch {};
+    cursor.seat.queueEvent(.{ .pointer_pinch_begin = .{
+        .time_msec = event.time_msec,
+        .fingers = event.fingers,
+    } }) catch {};
 }
 
 fn queuePinchUpdate(listener: *wl.Listener(*wlr.Pointer.event.PinchUpdate), event: *wlr.Pointer.event.PinchUpdate) void {
     const cursor: *Cursor = @fieldParentPtr("pinch_update", listener);
-    cursor.seat.queueEvent(.{ .pointer_pinch_update = event.* }) catch {};
+    cursor.seat.queueEvent(.{ .pointer_pinch_update = .{
+        .time_msec = event.time_msec,
+        .fingers = event.fingers,
+        .dx = event.dx,
+        .dy = event.dy,
+        .scale = event.scale,
+        .rotation = event.rotation,
+    } }) catch {};
 }
 
 fn queuePinchEnd(listener: *wl.Listener(*wlr.Pointer.event.PinchEnd), event: *wlr.Pointer.event.PinchEnd) void {
     const cursor: *Cursor = @fieldParentPtr("pinch_end", listener);
-    cursor.seat.queueEvent(.{ .pointer_pinch_end = event.* }) catch {};
+    cursor.seat.queueEvent(.{ .pointer_pinch_end = .{
+        .time_msec = event.time_msec,
+        .cancelled = event.cancelled,
+    } }) catch {};
 }
 
 fn queueSwipeBegin(listener: *wl.Listener(*wlr.Pointer.event.SwipeBegin), event: *wlr.Pointer.event.SwipeBegin) void {
     const cursor: *Cursor = @fieldParentPtr("swipe_begin", listener);
-    cursor.seat.queueEvent(.{ .pointer_swipe_begin = event.* }) catch {};
+    cursor.seat.queueEvent(.{ .pointer_swipe_begin = .{
+        .time_msec = event.time_msec,
+        .fingers = event.fingers,
+    } }) catch {};
 }
 
 fn queueSwipeUpdate(listener: *wl.Listener(*wlr.Pointer.event.SwipeUpdate), event: *wlr.Pointer.event.SwipeUpdate) void {
     const cursor: *Cursor = @fieldParentPtr("swipe_update", listener);
-    cursor.seat.queueEvent(.{ .pointer_swipe_update = event.* }) catch {};
+    cursor.seat.queueEvent(.{ .pointer_swipe_update = .{
+        .time_msec = event.time_msec,
+        .fingers = event.fingers,
+        .dx = event.dx,
+        .dy = event.dy,
+    } }) catch {};
 }
 
 fn queueSwipeEnd(listener: *wl.Listener(*wlr.Pointer.event.SwipeEnd), event: *wlr.Pointer.event.SwipeEnd) void {
     const cursor: *Cursor = @fieldParentPtr("swipe_end", listener);
-    cursor.seat.queueEvent(.{ .pointer_swipe_end = event.* }) catch {};
+    cursor.seat.queueEvent(.{ .pointer_swipe_end = .{
+        .time_msec = event.time_msec,
+        .cancelled = event.cancelled,
+    } }) catch {};
+}
+
+fn queueHoldBegin(listener: *wl.Listener(*wlr.Pointer.event.HoldBegin), event: *wlr.Pointer.event.HoldBegin) void {
+    const cursor: *Cursor = @fieldParentPtr("hold_begin", listener);
+    cursor.seat.queueEvent(.{ .pointer_hold_begin = .{
+        .time_msec = event.time_msec,
+        .fingers = event.fingers,
+    } }) catch {};
+}
+
+fn queueHoldEnd(listener: *wl.Listener(*wlr.Pointer.event.HoldEnd), event: *wlr.Pointer.event.HoldEnd) void {
+    const cursor: *Cursor = @fieldParentPtr("hold_end", listener);
+    cursor.seat.queueEvent(.{ .pointer_hold_end = .{
+        .time_msec = event.time_msec,
+        .cancelled = event.cancelled,
+    } }) catch {};
 }

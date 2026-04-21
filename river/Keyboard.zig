@@ -31,6 +31,11 @@ device_destroyed: bool = false,
 queued_events: u32 = 0,
 
 config: Config,
+
+/// Set of pressed keys that have been processed by processKey().
+/// Not equivalent to wlr_keyboard.keycodes.
+/// This state is necessary to handle removing keyboards from groups properly.
+pressed: std.AutoArrayHashMapUnmanaged(u32, void) = .empty,
 /// Only null during initialization or due to allocation failure.
 group: ?*KeyboardGroup = null,
 
@@ -62,6 +67,9 @@ pub fn create(seat: *Seat, wlr_device: *wlr.InputDevice, virtual: bool) !*Keyboa
     };
     errdefer if (keyboard.config.keymap) |keymap| keymap.unref();
 
+    try keyboard.pressed.ensureTotalCapacity(util.gpa, KeyboardGroup.pressed_count_max);
+    errdefer keyboard.pressed.deinit(util.gpa);
+
     try keyboard.device.init(seat, wlr_device, virtual);
     errdefer keyboard.device.deinit();
 
@@ -74,13 +82,30 @@ pub fn create(seat: *Seat, wlr_device: *wlr.InputDevice, virtual: bool) !*Keyboa
         wlr_keyboard.events.keymap.add(&keyboard.keymap);
     } else {
         keyboard.keymap.link.init();
-        // We must set a keymap even though this is not the wlr_keyboard river
-        // exposes to clients. If there is no keymap set, wlroots will not emit
-        // the modifiers event when using the Wayland or X11 backend.
-        _ = wlr_keyboard.setKeymap(keyboard.config.keymap);
+        if (shouldSetKeymap()) {
+            _ = wlr_keyboard.setKeymap(keyboard.config.keymap);
+        }
     }
 
     return keyboard;
+}
+
+// We don't want to ever set a keymap for backend-created wlr.Keyboards.
+// Setting a keymap means that modifiers will be buggy and LEDs will be out of sync.
+// However, if we don't set a keymap we don't get modifiers events from the backend
+// at all currently due to a wlroots bug. This is even worse, so set a keymap
+// despite the bugginess for backends that generate keyboard modifiers events.
+// TODO(wlroots) https://gitlab.freedesktop.org/wlroots/wlroots/-/merge_requests/5324
+fn shouldSetKeymap() bool {
+    var wayland_or_x11: bool = false;
+    server.backend.multiForEachBackend(*bool, shouldSetKeymapIter, &wayland_or_x11);
+    return wayland_or_x11;
+}
+
+fn shouldSetKeymapIter(backend: *wlr.Backend, wayland_or_x11: *bool) void {
+    if (backend.isWl() or (wlr.config.has_x11_backend and backend.isX11())) {
+        wayland_or_x11.* = true;
+    }
 }
 
 pub fn setGroup(keyboard: *Keyboard) void {
@@ -110,7 +135,7 @@ pub fn setRepeatInfo(keyboard: *Keyboard, rate: u31, delay: u31) void {
     keyboard.config.repeat_rate = rate;
     keyboard.config.repeat_delay = delay;
     if (keyboard.group) |group| {
-        group.unref();
+        group.unref(keyboard.pressed.keys());
         keyboard.group = null;
     }
     keyboard.setGroup();
@@ -118,11 +143,13 @@ pub fn setRepeatInfo(keyboard: *Keyboard, rate: u31, delay: u31) void {
 
 pub fn setKeymap(keyboard: *Keyboard, keymap: *xkb.Keymap) void {
     assert(!keyboard.device.virtual);
-    _ = keyboard.device.wlr_device.toKeyboard().setKeymap(keymap);
+    if (shouldSetKeymap()) {
+        _ = keyboard.device.wlr_device.toKeyboard().setKeymap(keyboard.config.keymap);
+    }
     if (keyboard.config.keymap) |old| old.unref();
     keyboard.config.keymap = keymap.ref();
     if (keyboard.group) |group| {
-        group.unref();
+        group.unref(keyboard.pressed.keys());
         keyboard.group = null;
     }
     keyboard.setGroup();
@@ -147,8 +174,9 @@ fn maybeDestroy(keyboard: *Keyboard) void {
     }
 
     if (keyboard.config.keymap) |keymap| keymap.unref();
-    if (keyboard.group) |group| group.unref();
+    if (keyboard.group) |group| group.unref(keyboard.pressed.keys());
 
+    keyboard.pressed.deinit(util.gpa);
     util.gpa.destroy(keyboard);
 }
 
@@ -158,6 +186,14 @@ pub fn dropEvent(keyboard: *Keyboard) void {
 }
 
 pub fn processKey(keyboard: *Keyboard, key: *const wlr.Keyboard.event.Key) void {
+    if (key.state == .released) {
+        _ = keyboard.pressed.swapRemove(key.keycode);
+    } else {
+        assert(key.state == .pressed);
+        if (keyboard.pressed.count() < KeyboardGroup.pressed_count_max) {
+            keyboard.pressed.putAssumeCapacity(key.keycode, {});
+        }
+    }
     if (keyboard.group) |group| group.processKey(key);
     keyboard.dropEvent();
 }

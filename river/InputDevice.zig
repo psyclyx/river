@@ -10,7 +10,7 @@ const wlr = @import("wlroots");
 const wl = @import("wayland").server.wl;
 const river = @import("wayland").server.river;
 
-const c = @import("c.zig").c;
+const c = @import("c");
 const server = &@import("main.zig").server;
 const util = @import("util.zig");
 
@@ -76,6 +76,9 @@ pub fn init(
         if (wlr_device.getLibinputDevice()) |handle| {
             device.libinput.init(@ptrCast(handle));
         }
+        if (wlr_device.type == .keyboard) {
+            device.xkb_keyboard.init();
+        }
     }
 
     // The wlroots Wayland and X11 backends support multiple outputs
@@ -95,9 +98,6 @@ pub fn init(
                 break;
             }
         }
-    }
-    if (wlr_device.type == .keyboard) {
-        device.xkb_keyboard.init();
     }
 }
 
@@ -123,16 +123,24 @@ pub fn createObject(device: *InputDevice, im_v1: *river.InputManagerV1) void {
 }
 
 pub fn deinit(device: *InputDevice) void {
-    assert(device.objects.empty());
+    if (!device.virtual) {
+        {
+            var it = device.objects.iterator(.forward);
+            while (it.next()) |object| {
+                object.getLink().remove();
+                object.sendRemoved();
+                object.setHandler(?*anyopaque, handleRequestInert, null, null);
+            }
+        }
+        if (device.wlr_device.getLibinputDevice() != null) {
+            device.libinput.deinit();
+        }
+        if (device.wlr_device.type == .keyboard) {
+            device.xkb_keyboard.deinit();
+        }
+    }
+
     device.remove.link.remove();
-
-    if (device.wlr_device.getLibinputDevice() != null) {
-        device.libinput.deinit();
-    }
-    if (device.wlr_device.type == .keyboard) {
-        device.xkb_keyboard.deinit();
-    }
-
     device.link.remove();
     device.seat.updateCapabilities();
 
@@ -150,6 +158,19 @@ pub fn assignToSeat(device: *InputDevice, new: *Seat) void {
     new.updateCapabilities();
 }
 
+/// Retuns the curretly active mapping for the device, or an empty box if
+/// the movement of the device is unrestricted.
+pub fn activeMapping(device: *const InputDevice) wlr.Box {
+    var mapping = device.config.map_to_rectangle;
+    if (!mapping.empty()) {
+        return mapping;
+    }
+    if (device.config.map_to_output) |output| {
+        server.om.output_layout.getBox(output, &mapping);
+    }
+    return mapping;
+}
+
 fn handleRemove(listener: *wl.Listener(*wlr.InputDevice), _: *wlr.InputDevice) void {
     const device: *InputDevice = @fieldParentPtr("remove", listener);
 
@@ -157,15 +178,6 @@ fn handleRemove(listener: *wl.Listener(*wlr.InputDevice), _: *wlr.InputDevice) v
         @tagName(device.wlr_device.type),
         device.wlr_device.name orelse "unknown",
     });
-
-    {
-        var it = device.objects.iterator(.forward);
-        while (it.next()) |object| {
-            object.getLink().remove();
-            object.sendRemoved();
-            object.setHandler(?*anyopaque, handleRequestInert, null, null);
-        }
-    }
 
     switch (device.wlr_device.type) {
         .keyboard => {
@@ -240,10 +252,17 @@ fn handleRequest(
             } else {
                 device.config.map_to_output = null;
             }
-            device.seat.cursor.wlr_cursor.mapInputToOutput(
-                device.wlr_device,
-                device.config.map_to_output,
-            );
+            switch (device.wlr_device.type) {
+                .touch, .tablet => {
+                    device.seat.cursor.wlr_cursor.mapInputToOutput(
+                        device.wlr_device,
+                        device.config.map_to_output,
+                    );
+                },
+                // River implements pointer mappings without help from wlroots
+                .pointer => {},
+                .keyboard, .@"switch", .tablet_pad => unreachable,
+            }
         },
         .map_to_rectangle => |args| {
             if (args.width < 0 or args.height < 0) {
@@ -260,10 +279,17 @@ fn handleRequest(
                 .width = args.width,
                 .height = args.height,
             };
-            device.seat.cursor.wlr_cursor.mapInputToRegion(
-                device.wlr_device,
-                &device.config.map_to_rectangle,
-            );
+            switch (device.wlr_device.type) {
+                .touch, .tablet => {
+                    device.seat.cursor.wlr_cursor.mapInputToRegion(
+                        device.wlr_device,
+                        &device.config.map_to_rectangle,
+                    );
+                },
+                // River implements pointer mappings without help from wlroots
+                .pointer => {},
+                .keyboard, .@"switch", .tablet_pad => unreachable,
+            }
         },
     }
 }

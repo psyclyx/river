@@ -89,7 +89,7 @@ pub fn create(seat: *Seat, config: Keyboard.Config, virtual: bool) !*KeyboardGro
 
     group.state.init(&.{
         .name = "river.KeyboardGroup",
-        .led_update = null, // TODO
+        .led_update = ledUpdate,
     }, "river.KeyboardGroup");
     group.state.data = group;
 
@@ -108,7 +108,16 @@ pub fn ref(group: *KeyboardGroup) *KeyboardGroup {
     return group;
 }
 
-pub fn unref(group: *KeyboardGroup) void {
+pub fn unref(group: *KeyboardGroup, to_release: []u32) void {
+    for (to_release) |keycode| {
+        group.processKey(&.{
+            .time_msec = util.msecTimestamp(),
+            .keycode = keycode,
+            .update_state = true,
+            .state = .released,
+        });
+    }
+
     group.ref_count -= 1;
     if (group.ref_count > 0) {
         return;
@@ -232,7 +241,7 @@ fn handleKey(listener: *wl.Listener(*wlr.Keyboard.event.Key), event: *wlr.Keyboa
         const xkb_keycode = event.keycode + 8;
         const modifiers = group.state.getModifiers();
         for (xkb_state.keyGetSyms(xkb_keycode)) |sym| {
-            if (handleBuiltinBinding(sym, modifiers)) {
+            if (handleBuiltinBinding(sym)) {
                 log.debug("matched builtin binding", .{});
                 break :blk .builtin;
             }
@@ -302,7 +311,7 @@ fn handleKey(listener: *wl.Listener(*wlr.Keyboard.event.Key), event: *wlr.Keyboa
 }
 
 fn keysymIsModifier(keysym: xkb.Keysym) bool {
-    switch (@intFromEnum(keysym)) {
+    switch (keysym) {
         xkb.Keysym.Shift_L,
         xkb.Keysym.Shift_R,
         xkb.Keysym.Control_L,
@@ -363,25 +372,16 @@ fn handleModifiers(listener: *wl.Listener(*wlr.Keyboard), _: *wlr.Keyboard) void
 
 /// Handle any builtin, hardcoded compositor keybindings such as VT switching.
 /// Returns true if the keysym was handled.
-fn handleBuiltinBinding(keysym: xkb.Keysym, modifiers: wlr.Keyboard.ModifierMask) bool {
+fn handleBuiltinBinding(keysym: xkb.Keysym) bool {
     switch (@intFromEnum(keysym)) {
-        xkb.Keysym.XF86Switch_VT_1...xkb.Keysym.XF86Switch_VT_12 => {
+        @intFromEnum(xkb.Keysym.XF86Switch_VT_1)...@intFromEnum(xkb.Keysym.XF86Switch_VT_12) => {
             log.debug("switch VT keysym received", .{});
             if (server.session) |session| {
-                const vt = @intFromEnum(keysym) - xkb.Keysym.XF86Switch_VT_1 + 1;
+                const vt = @intFromEnum(keysym) - @intFromEnum(xkb.Keysym.XF86Switch_VT_1) + 1;
                 std.log.info("switching to VT {}", .{vt});
                 session.changeVt(vt) catch std.log.err("changing VT failed", .{});
             }
             return true;
-        },
-        xkb.Keysym.Delete => {
-            if (modifiers == wlr.Keyboard.ModifierMask{ .ctrl = true, .alt = true }) {
-                log.debug("ctrl+alt+delete pressed, exiting...", .{});
-                server.wl_server.terminate();
-                return true;
-            } else {
-                return false;
-            }
         },
         else => return false,
     }
@@ -425,5 +425,17 @@ pub fn sendState(group: *KeyboardGroup) void {
         if (keyboard.group != group) continue;
 
         xkb_keyboard.sendState(layout_index, layout_name, capslock, numlock);
+    }
+}
+
+fn ledUpdate(state: *wlr.Keyboard, leds: u32) callconv(.c) void {
+    const group: *KeyboardGroup = @fieldParentPtr("state", state);
+    var it = server.input_manager.devices.iterator(.forward);
+    while (it.next()) |device| {
+        if (device.wlr_device.type != .keyboard) continue;
+        const keyboard: *Keyboard = @fieldParentPtr("device", device);
+        if (keyboard.group != group) continue;
+        const wlr_keyboard = device.wlr_device.toKeyboard();
+        wlr_keyboard.ledUpdate(leds);
     }
 }

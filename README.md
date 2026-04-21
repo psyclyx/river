@@ -14,6 +14,9 @@ river does not combine the compositor and window manager into one program.
 Instead, users can choose any window manager implementing the
 [river-window-management-v1] protocol.
 
+Read my blog post, [Separating the Wayland Compositor and Window Manager](https://isaacfreund.com/blog/river-window-management/),
+for an in-depth explanation.
+
 There is a [list of compatible window managers](https://codeberg.org/river/wiki/src/branch/main/pages/wm-list.md)
 on our [wiki](https://codeberg.org/river/wiki).
 
@@ -23,6 +26,7 @@ on our [wiki](https://codeberg.org/river/wiki).
 ## Links
 
 - [Protocol Docs](https://isaacfreund.com/docs/wayland/)
+- [tinyrwm](https://codeberg.org/river/tinyrwm) example window manager
 - [Wiki](https://codeberg.org/river/wiki)
 - IRC: [#river](https://web.libera.chat/?channels=#river) on irc.libera.chat ([logs](https://libera.catirclogs.org/river))
 - [Zulip](https://river-compositor.zulipchat.com) (new)
@@ -40,9 +44,12 @@ River itself provides frame perfect rendering, good performance, support for
 many Wayland protocol extensions, robust Xwayland support, the ability to
 hot-swap window managers, and more.
 
+The [river-window-management-v1] protocol and other river protocol extensions
+are stable.  We do not break window managers.
+
 ## Motivation
 
-Why split the window manager to a separate process? I aim to:
+Why split the window manager to a separate process?
 
 - Significantly lower the barrier to entry for writing a Wayland window manager.
 - Allow implementing Wayland window managers in high-level garbage collected
@@ -50,25 +57,6 @@ Why split the window manager to a separate process? I aim to:
 - Allow hot-swapping between window managers without restarting the compositor
   and all Wayland programs.
 - Promote diversity and experimentation in window manager design.
-
-## Current Status
-
-The first release supporting the [river-window-management-v1] protocol will be
-0.4.0. The protocol is implemented on river's main branch and is already
-robust/feature complete enough for me to use as my daily driver.
-
-The [river-window-management-v1] protocol and other river protocol extensions
-are stable.  We do not break window managers.
-
-Currently the only documentation for the [river-window-management-v1] protocol
-is the protocol specification itself. While this is all developers comfortable
-with writing Wayland clients should need, I'd like to add some more
-beginner-friendly documentation including a well-commented example window
-manager before the 0.4.0 release.
-
-If everything goes well with the 0.4.0 release, I expect the following
-non-bugfix release to be river 1.0.0. After river 1.0.0, all backwards
-incompatible changes will be strictly avoided.
 
 ## Building
 
@@ -78,10 +66,10 @@ To compile river first ensure that you have the following dependencies
 installed. The "development" versions are required if applicable to your
 distribution.
 
-- [zig](https://ziglang.org/download/) 0.15
+- [zig](https://ziglang.org/download/) 0.16
 - wayland
 - wayland-protocols
-- [wlroots](https://gitlab.freedesktop.org/wlroots/wlroots) 0.19
+- [wlroots](https://gitlab.freedesktop.org/wlroots/wlroots) 0.20
 - xkbcommon 1.12 or newer
 - libevdev
 - pixman
@@ -109,10 +97,20 @@ and any other long-running programs.
 
 For complete documentation see the `river(1)` man page.
 
+## Strict No LLM / No AI Policy
+
+Use of generative AI/LLMs is strictly forbidden for all contributions to river.
+
+This includes bug reports and comments on the issue tracker.
+
 ## Donate
 
-If my work on river adds value to your life and you'd like to support me
-financially you can find donation information [here](https://isaacfreund.com/donate/).
+Unfortunately, the current pace of river's development is not sustainable
+without more financial support. If my work on river adds value to your life
+please consider setting up a recurring donation through [liberapay]. You can
+also support me with a one-time or monthly donation on [github sponsors] or
+[ko-fi] though I prefer liberapay as it is run by a non-profit. Thank you for
+your support!
 
 ## Fork changes
 
@@ -134,3 +132,6 @@ In overview:
 - River's logo and documentation are released under the CC-BY-SA-4.0 license.
 
 [river-window-management-v1]: https://isaacfreund.com/docs/wayland/river-window-management-v1
+[liberapay]: https://liberapay.com/ifreund
+[github sponsors]: https://github.com/sponsors/ifreund
+[ko-fi]: https://ko-fi.com/ifreund

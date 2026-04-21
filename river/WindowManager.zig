@@ -43,7 +43,11 @@ windows: SlotMap(*Window) = .empty,
 /// State to be sent to the wm in the next manage sequence.
 scheduled: struct {
     /// State has been modified since the last manage sequence.
+    /// Prevents processing further input events until a manage sequence is completed.
     dirty: bool = false,
+    /// A manage sequence should be started when idle, but don't prevent processing
+    /// further input events.
+    dirty_lazy: bool = false,
 
     output_config: ?*wlr.OutputConfigurationV1 = null,
 } = .{},
@@ -80,7 +84,7 @@ pub fn init(wm: *WindowManager) !void {
     errdefer timeout.remove();
 
     wm.* = .{
-        .global = try wl.Global.create(server.wl_server, river.WindowManagerV1, 3, *WindowManager, wm, bind),
+        .global = try wl.Global.create(server.wl_server, river.WindowManagerV1, 4, *WindowManager, wm, bind),
         .sent = .{
             .outputs = undefined,
             .seats = undefined,
@@ -133,6 +137,18 @@ fn handleRequestInert(
 fn handleDestroy(_: *river.WindowManagerV1, wm: *WindowManager) void {
     log.debug("active river_window_manager_v1 destroyed", .{});
     wm.object = null;
+    {
+        var it = server.om.outputs.iterator(.forward);
+        while (it.next()) |output| output.makeInert();
+    }
+    {
+        var it = server.input_manager.seats.iterator(.forward);
+        while (it.next()) |seat| seat.makeInert();
+    }
+    {
+        var it = wm.windows.iterator();
+        while (it.next()) |window| window.makeInert();
+    }
     switch (wm.state) {
         .idle => {},
         .inflight_configures => {},
@@ -164,7 +180,10 @@ fn handleRequest(
             }
             wm.manageFinish();
         },
-        .manage_dirty => wm.dirtyWindowing(),
+        .manage_dirty => {
+            wm.scheduled.dirty_lazy = true;
+            wm.addDirtyIdle();
+        },
         .render_finish => {
             if (wm.state != .render) {
                 wm_v1.postError(.sequence_order,
@@ -186,6 +205,10 @@ fn handleRequest(
                 log.err("out of memory", .{});
                 return;
             };
+        },
+        .exit_session => {
+            log.info("window manager requested to exit session", .{});
+            server.wl_server.terminate();
         },
     }
 }
@@ -219,6 +242,11 @@ pub fn dirtyWindowing(wm: *WindowManager) void {
     wm.addDirtyIdle();
 }
 
+pub fn dirtyWindowingLazy(wm: *WindowManager) void {
+    wm.scheduled.dirty_lazy = true;
+    wm.addDirtyIdle();
+}
+
 pub fn cleanWindowing(wm: *WindowManager) void {
     wm.scheduled.dirty = false;
     wm.removeDirtyIdle();
@@ -235,7 +263,7 @@ pub fn cleanRendering(wm: *WindowManager) void {
 }
 
 fn addDirtyIdle(wm: *WindowManager) void {
-    assert(wm.scheduled.dirty or wm.rendering_scheduled.dirty);
+    assert(wm.scheduled.dirty or wm.scheduled.dirty_lazy or wm.rendering_scheduled.dirty);
     if (wm.dirty_idle == null) {
         const event_loop = server.wl_server.getEventLoop();
         wm.dirty_idle = event_loop.addIdle(*WindowManager, dirtyIdle, wm) catch {
@@ -255,13 +283,16 @@ fn removeDirtyIdle(wm: *WindowManager) void {
 }
 
 fn dirtyIdle(wm: *WindowManager) void {
-    assert(wm.scheduled.dirty or wm.rendering_scheduled.dirty);
+    assert(wm.scheduled.dirty or wm.scheduled.dirty_lazy or wm.rendering_scheduled.dirty);
     wm.dirty_idle = null;
     switch (wm.state) {
         .idle => {
             if (wm.rendering_scheduled.dirty) {
                 wm.renderStart();
             } else {
+                assert(wm.scheduled.dirty or wm.scheduled.dirty_lazy);
+                wm.scheduled.dirty = true;
+                wm.scheduled.dirty_lazy = false;
                 wm.manageStart();
             }
         },
@@ -374,12 +405,12 @@ fn handleTimeout(wm: *WindowManager) c_int {
 
             wm.renderStart();
         },
-        .manage, .render => {
+        .manage, .render => if (wm.object) |wm_v1| {
             log.err("window manager unresponsive for more than 3 seconds, disconnecting", .{});
-            wm.object.?.postError(.unresponsive, "unresponsive for more than 3 seconds");
+            wm_v1.postError(.unresponsive, "unresponsive for more than 3 seconds");
             // Don't wait for the frozen client to receive the protocol error
             // and exit of its own accord.
-            wm.object.?.getClient().destroy();
+            wm_v1.getClient().destroy();
         },
         .idle => unreachable,
     }
@@ -523,11 +554,9 @@ fn renderFinish(wm: *WindowManager) void {
 
     log.debug("finished committing transaction", .{});
 
-    if (wm.rendering_scheduled.dirty) {
-        wm.dirtyRendering();
-    } else if (wm.scheduled.dirty) {
-        wm.dirtyWindowing();
-    } else {
-        server.input_manager.processEvents();
+    if (wm.scheduled.dirty or wm.scheduled.dirty_lazy or wm.rendering_scheduled.dirty) {
+        wm.addDirtyIdle();
     }
+
+    server.input_manager.processEvents();
 }

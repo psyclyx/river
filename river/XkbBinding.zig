@@ -137,7 +137,7 @@ fn handleRequest(
 
 pub fn pressed(binding: *XkbBinding) void {
     assert(!binding.sent_pressed);
-    // Input event processing should not continue after a state_change
+    // Input event processing should not continue after a state change
     // until that event is sent to the window manager in an update and acked.
     assert(binding.wm_scheduled.state_change == .none);
     binding.wm_scheduled.state_change = .pressed;
@@ -148,7 +148,12 @@ pub fn stopRepeat(binding: *XkbBinding) void {
     assert(binding.sent_pressed);
     // Input event processing should not continue after a state change
     // until that event is sent to the window manager in an update and acked.
-    assert(binding.wm_scheduled.state_change == .none);
+    // However, stop_repeat is special since it is triggered on any key event.
+    // This means that when a keyboard is removed from a group and all keys
+    // pressed on that keyboard are released at the same time stopRepeat()
+    // may be called more than once.
+    assert(binding.wm_scheduled.state_change == .none or
+        binding.wm_scheduled.state_change == .stop_repeat);
     binding.wm_scheduled.state_change = .stop_repeat;
     server.wm.dirtyWindowing();
 }

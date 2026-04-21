@@ -12,7 +12,6 @@ const wayland = @import("wayland");
 const wl = wayland.server.wl;
 const river = wayland.server.river;
 const xkb = @import("xkbcommon");
-const Deque = @import("deque").Deque;
 
 const server = &@import("main.zig").server;
 const util = @import("util.zig");
@@ -54,19 +53,90 @@ pub const Event = union(enum) {
         keymap: *xkb.Keymap,
     },
 
-    pointer_motion_relative: wlr.Pointer.event.Motion,
-    pointer_motion_absolute: wlr.Pointer.event.MotionAbsolute,
-    pointer_button: wlr.Pointer.event.Button,
-    pointer_axis: wlr.Pointer.event.Axis,
+    pointer_motion_relative: PointerMotionRelative,
+    pointer_motion_absolute: PointerMotionAbsolute,
+    pointer_button: PointerButton,
+    pointer_axis: PointerAxis,
     pointer_frame: void,
 
-    pointer_swipe_begin: wlr.Pointer.event.SwipeBegin,
-    pointer_swipe_update: wlr.Pointer.event.SwipeUpdate,
-    pointer_swipe_end: wlr.Pointer.event.SwipeEnd,
+    pointer_swipe_begin: PointerSwipeBegin,
+    pointer_swipe_update: PointerSwipeUpdate,
+    pointer_swipe_end: PointerSwipeEnd,
 
-    pointer_pinch_begin: wlr.Pointer.event.PinchBegin,
-    pointer_pinch_update: wlr.Pointer.event.PinchUpdate,
-    pointer_pinch_end: wlr.Pointer.event.PinchEnd,
+    pointer_pinch_begin: PointerPinchBegin,
+    pointer_pinch_update: PointerPinchUpdate,
+    pointer_pinch_end: PointerPinchEnd,
+
+    pointer_hold_begin: PointerHoldBegin,
+    pointer_hold_end: PointerHoldEnd,
+
+    pub const PointerMotionRelative = struct {
+        mapping: wlr.Box,
+        time_msec: u32,
+        delta_x: f64,
+        delta_y: f64,
+        unaccel_dx: f64,
+        unaccel_dy: f64,
+    };
+    pub const PointerMotionAbsolute = struct {
+        mapping: wlr.Box,
+        time_msec: u32,
+        x: f64,
+        y: f64,
+    };
+    pub const PointerButton = struct {
+        time_msec: u32,
+        button: u32,
+        state: wl.Pointer.ButtonState,
+    };
+    pub const PointerAxis = struct {
+        time_msec: u32,
+        source: wl.Pointer.AxisSource,
+        orientation: wl.Pointer.Axis,
+        relative_direction: wl.Pointer.AxisRelativeDirection,
+        delta: f64,
+        delta_discrete: i32,
+    };
+
+    pub const PointerSwipeBegin = struct {
+        time_msec: u32,
+        fingers: u32,
+    };
+    pub const PointerSwipeUpdate = struct {
+        time_msec: u32,
+        fingers: u32,
+        dx: f64,
+        dy: f64,
+    };
+    pub const PointerSwipeEnd = struct {
+        time_msec: u32,
+        cancelled: bool,
+    };
+
+    pub const PointerPinchBegin = struct {
+        time_msec: u32,
+        fingers: u32,
+    };
+    pub const PointerPinchUpdate = struct {
+        time_msec: u32,
+        fingers: u32,
+        dx: f64,
+        dy: f64,
+        scale: f64,
+        rotation: f64,
+    };
+    pub const PointerPinchEnd = struct {
+        time_msec: u32,
+        cancelled: bool,
+    };
+    pub const PointerHoldBegin = struct {
+        time_msec: u32,
+        fingers: u32,
+    };
+    pub const PointerHoldEnd = struct {
+        time_msec: u32,
+        cancelled: bool,
+    };
 };
 
 pub const Focus = union(enum) {
@@ -99,7 +169,7 @@ object: ?*river.SeatV1 = null,
 layer_shell: LayerShellSeat = .{},
 xkb_bindings_seat: XkbBindingsSeat = .{},
 
-event_queue: Deque(Event),
+event_queue: std.Deque(Event),
 
 /// State to be sent to the wm in the next manage sequence.
 wm_scheduled: struct {
@@ -146,7 +216,6 @@ pointer_bindings: wl.list.Head(PointerBinding, .link),
 cursor: Cursor,
 
 op: ?struct {
-    dirty: bool = false,
     sent_release: bool = false,
     input: enum {
         pointer,
@@ -183,7 +252,7 @@ pub fn create(name: [*:0]const u8) !void {
 
     // Empirically, this limit is not hit in practice unless the window manager hangs.
     // TODO have better reasoning for choosing this capacity.
-    var event_queue: Deque(Event) = try .initCapacity(util.gpa, 1024);
+    var event_queue: std.Deque(Event) = try .initCapacity(util.gpa, 1024);
     errdefer event_queue.deinit(util.gpa);
 
     seat.* = .{
@@ -218,6 +287,8 @@ pub fn create(name: [*:0]const u8) !void {
 }
 
 pub fn destroy(seat: *Seat) void {
+    seat.makeInert();
+
     while (seat.event_queue.popFront()) |event| {
         switch (event) {
             .keyboard_key => |data| data.keyboard.dropEvent(),
@@ -237,9 +308,12 @@ pub fn destroy(seat: *Seat) void {
             .pointer_pinch_begin,
             .pointer_pinch_update,
             .pointer_pinch_end,
+            .pointer_hold_begin,
+            .pointer_hold_end,
             => {},
         }
     }
+
     {
         var it = server.input_manager.devices.iterator(.forward);
         while (it.next()) |device| {
@@ -253,9 +327,6 @@ pub fn destroy(seat: *Seat) void {
         while (it.next()) |device| assert(device.seat != seat);
     }
     assert(seat.keyboard_groups.empty());
-
-    while (seat.xkb_bindings.first()) |binding| binding.destroy();
-    while (seat.pointer_bindings.first()) |binding| binding.destroy();
 
     seat.link.remove();
     seat.link_sent.remove();
@@ -315,27 +386,16 @@ pub fn processEvents(seat: *Seat) void {
             .pointer_pinch_begin => |ev| pg.sendPinchBegin(seat.wlr_seat, ev.time_msec, ev.fingers),
             .pointer_pinch_update => |ev| pg.sendPinchUpdate(seat.wlr_seat, ev.time_msec, ev.dx, ev.dy, ev.scale, ev.rotation),
             .pointer_pinch_end => |ev| pg.sendPinchEnd(seat.wlr_seat, ev.time_msec, ev.cancelled),
+
+            .pointer_hold_begin => |ev| pg.sendHoldBegin(seat.wlr_seat, ev.time_msec, ev.fingers),
+            .pointer_hold_end => |ev| pg.sendHoldEnd(seat.wlr_seat, ev.time_msec, ev.cancelled),
         }
     }
     assert(server.wm.state == .idle);
-
-    if (seat.op) |*op| {
-        if (op.dirty) {
-            op.dirty = false;
-            server.wm.dirtyWindowing();
-        }
-    }
 }
 
 pub fn manageStart(seat: *Seat) void {
     if (seat.destroying) {
-        if (seat.object) |seat_v1| {
-            seat_v1.sendRemoved();
-            seat_v1.setHandler(?*anyopaque, handleRequestInert, null, null);
-            seat.layer_shell.makeInert();
-            seat.xkb_bindings_seat.makeInert();
-            seat.object = null;
-        }
         seat.destroy();
         return;
     }
@@ -346,6 +406,12 @@ pub fn manageStart(seat: *Seat) void {
     if (server.wm.object) |wm_v1| {
         const new = seat.object == null;
         const seat_v1 = seat.object orelse blk: {
+            assert(seat.op == null);
+            assert(seat.layer_shell.object == null);
+            assert(seat.xkb_bindings_seat.object == null);
+            assert(seat.xkb_bindings.empty());
+            assert(seat.pointer_bindings.empty());
+
             const seat_v1 = river.SeatV1.create(wm_v1.getClient(), wm_v1.getVersion(), 0) catch {
                 log.err("out of memory", .{});
                 return; // try again next update
@@ -397,6 +463,8 @@ pub fn manageStart(seat: *Seat) void {
                 if (seat_v1.getVersion() >= 2) {
                     seat_v1.sendPointerPosition(x, y);
                 }
+                seat.wm_sent.x = x;
+                seat.wm_sent.y = y;
             }
         }
 
@@ -474,6 +542,20 @@ pub fn manageStart(seat: *Seat) void {
     seat.wm_scheduled.interaction = .none;
 }
 
+pub fn makeInert(seat: *Seat) void {
+    if (seat.object) |seat_v1| {
+        seat_v1.sendRemoved();
+        seat_v1.setHandler(?*anyopaque, handleRequestInert, null, null);
+        handleDestroy(seat_v1, seat);
+    } else {
+        assert(seat.op == null);
+        assert(seat.layer_shell.object == null);
+        assert(seat.xkb_bindings_seat.object == null);
+        assert(seat.xkb_bindings.empty());
+        assert(seat.pointer_bindings.empty());
+    }
+}
+
 fn handleRequestInert(
     seat_v1: *river.SeatV1,
     request: river.SeatV1.Request,
@@ -485,6 +567,14 @@ fn handleRequestInert(
 fn handleDestroy(_: *river.SeatV1, seat: *Seat) void {
     seat.object = null;
     seat.opEnd();
+
+    seat.layer_shell.makeInert();
+    seat.xkb_bindings_seat.makeInert();
+
+    while (seat.xkb_bindings.first()) |binding| binding.destroy();
+    while (seat.pointer_bindings.first()) |binding| binding.destroy();
+
+    seat.object = null;
 }
 
 fn handleRequest(
@@ -660,7 +750,7 @@ pub fn focus(seat: *Seat, new_focus: Focus) void {
 }
 
 /// Send keyboard enter/leave events and handle pointer constraints
-/// This should never normally be called from outside of setFocusRaw(), but we make an exception for
+/// This should never normally be called from outside of focus(), but we make an exception for
 /// XwaylandOverrideRedirect surfaces as they don't conform to the Wayland focus model.
 pub fn keyboardEnterOrLeave(seat: *Seat, target_surface: ?*wlr.Surface) void {
     if (target_surface) |wlr_surface| {
@@ -776,7 +866,7 @@ pub fn opUpdate(seat: *Seat, x: i32, y: i32) void {
     const op = &seat.op.?;
     op.x = x;
     op.y = y;
-    op.dirty = true;
+    server.wm.dirtyWindowingLazy();
 }
 
 pub fn opEnd(seat: *Seat) void {
@@ -835,7 +925,9 @@ pub fn attachDevice(seat: *Seat, device: *InputDevice) void {
                 }
             }
         },
-        .pointer, .touch, .tablet => {
+        // River implements pointer mappings without help from wlroots
+        .pointer => seat.cursor.wlr_cursor.attachInputDevice(device.wlr_device),
+        .touch, .tablet => {
             seat.cursor.wlr_cursor.attachInputDevice(device.wlr_device);
             seat.cursor.wlr_cursor.mapInputToOutput(device.wlr_device, device.config.map_to_output);
             seat.cursor.wlr_cursor.mapInputToRegion(device.wlr_device, &device.config.map_to_rectangle);
@@ -850,7 +942,7 @@ pub fn detachDevice(seat: *Seat, device: *InputDevice) void {
     if (device.wlr_device.type == .keyboard) {
         const keyboard: *Keyboard = @fieldParentPtr("device", device);
         if (keyboard.group) |group| {
-            group.unref();
+            group.unref(keyboard.pressed.keys());
             keyboard.group = null;
         }
     }

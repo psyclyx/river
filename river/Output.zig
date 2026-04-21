@@ -123,6 +123,13 @@ pub const State = struct {
     }
 };
 
+const RenderingState = struct {
+    tearing: bool,
+    const init: RenderingState = .{
+        .tearing = false,
+    };
+};
+
 /// Set to null when the wlr_output is destroyed.
 wlr_output: ?*wlr.Output,
 scene_output: ?*wlr.SceneOutput,
@@ -160,8 +167,11 @@ scheduled: State,
 sent: State,
 link_sent: wl.list.Link,
 sent_wl_output: bool = false,
+/// Rendering state requested by the window manager.
+rendering_requested: RenderingState = .init,
 /// State applied to the wlr_output and rendered.
 current: State,
+rendering_current: RenderingState = .init,
 
 destroy: wl.Listener(*wlr.Output) = .init(handleDestroy),
 request_state: wl.Listener(*wlr.Output.event.RequestState) = .init(handleRequestState),
@@ -328,12 +338,7 @@ pub fn manageStart(output: *Output) void {
             server.wm.sent.outputs.append(output);
         },
         .disabled_hard, .destroying => {
-            if (output.object) |output_v1| {
-                output_v1.sendRemoved();
-                output_v1.setHandler(?*anyopaque, handleRequestInert, null, null);
-                output.layer_shell.makeInert();
-                handleObjectDestroy(output_v1, output);
-            }
+            output.makeInert();
 
             output.sent = output.scheduled;
 
@@ -364,6 +369,15 @@ pub fn manageStart(output: *Output) void {
     }
 }
 
+pub fn makeInert(output: *Output) void {
+    if (output.object) |output_v1| {
+        output_v1.sendRemoved();
+        output_v1.setHandler(?*anyopaque, handleRequestInert, null, null);
+        output.layer_shell.makeInert();
+        handleObjectDestroy(output_v1, output);
+    }
+}
+
 fn handleRequestInert(
     output_v1: *river.OutputV1,
     request: river.OutputV1.Request,
@@ -385,6 +399,17 @@ fn handleRequest(
     assert(output.object == output_v1);
     switch (request) {
         .destroy => output_v1.destroy(),
+        .set_presentation_mode => |args| {
+            if (!server.wm.ensureRendering()) return;
+            output.rendering_requested.tearing = switch (args.mode) {
+                .vsync => false,
+                .async => true,
+                _ => {
+                    output_v1.postError(.invalid_presentation_mode, "invalid presentation mode enum value");
+                    return;
+                },
+            };
+        },
     }
 }
 
@@ -424,7 +449,7 @@ fn handleFrame(listener: *wl.Listener(*wlr.Output), wlr_output: *wlr.Output) voi
         error.CommitFailed => log.err("output commit failed for {s}", .{wlr_output.name}),
     };
 
-    var now = posix.clock_gettime(posix.CLOCK.MONOTONIC) catch @panic("CLOCK_MONOTONIC not supported");
+    var now = util.timestamp();
     output.scene_output.?.sendFrameDone(&now);
 }
 
@@ -439,6 +464,16 @@ fn renderAndCommit(output: *Output) !void {
     output.current.applyNoModeset(&state);
 
     if (!output.scene_output.?.buildState(&state, null)) return error.CommitFailed;
+
+    if (output.rendering_current.tearing) {
+        state.tearing_page_flip = true;
+        // TODO don't try this every frame if it consistently fails. Stop trying if it fails
+        // for 10 frames in a row or something.
+        if (!wlr_output.testState(&state)) {
+            log.info("tearing page flip test failed for {s}, retrying without tearing", .{wlr_output.name});
+            state.tearing_page_flip = false;
+        }
+    }
 
     if (!wlr_output.commitState(&state)) return error.CommitFailed;
 

@@ -11,6 +11,7 @@ const manifest = @import("build.zig.zon");
 const version = manifest.version;
 
 const Scanner = @import("wayland").Scanner;
+const Translator = @import("translate_c").Translator;
 
 pub fn build(b: *Build) !void {
     const target = b.standardTargetOptions(.{});
@@ -31,7 +32,6 @@ pub fn build(b: *Build) !void {
     ) orelse scdoc_found: {
         _ = b.findProgram(&.{"scdoc"}, &.{}) catch |err| switch (err) {
             error.FileNotFound => break :scdoc_found false,
-            else => return err,
         };
         break :scdoc_found true;
     };
@@ -51,7 +51,7 @@ pub fn build(b: *Build) !void {
             const git_describe_long = b.runAllowFail(
                 &.{ "git", "-C", b.build_root.path orelse ".", "describe", "--long" },
                 &ret,
-                .Ignore,
+                .ignore,
             ) catch break :blk version;
 
             var it = mem.splitSequence(u8, mem.trim(u8, git_describe_long, &std.ascii.whitespace), "-");
@@ -74,10 +74,13 @@ pub fn build(b: *Build) !void {
 
     const scanner = Scanner.create(b, .{});
 
-    scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
     scanner.addSystemProtocol("stable/tablet/tablet-v2.xml");
+    scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
+    scanner.addSystemProtocol("staging/color-management/color-management-v1.xml");
+    scanner.addSystemProtocol("staging/color-representation/color-representation-v1.xml");
     scanner.addSystemProtocol("staging/cursor-shape/cursor-shape-v1.xml");
     scanner.addSystemProtocol("staging/ext-session-lock/ext-session-lock-v1.xml");
+    scanner.addSystemProtocol("staging/tearing-control/tearing-control-v1.xml");
     scanner.addSystemProtocol("unstable/pointer-constraints/pointer-constraints-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/pointer-gestures/pointer-gestures-unstable-v1.xml");
     scanner.addSystemProtocol("unstable/xdg-decoration/xdg-decoration-unstable-v1.xml");
@@ -91,6 +94,7 @@ pub fn build(b: *Build) !void {
 
     scanner.addCustomProtocol(b.path("protocol/upstream/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/upstream/wlr-output-power-management-unstable-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/upstream/virtual-keyboard-unstable-v1.xml"));
 
     // Some of these versions may be out of date with what wlroots implements.
     // This is not a problem in practice though as long as river successfully compiles.
@@ -111,8 +115,11 @@ pub fn build(b: *Build) !void {
     scanner.generate("zxdg_decoration_manager_v1", 1);
     scanner.generate("ext_session_lock_manager_v1", 1);
     scanner.generate("wp_cursor_shape_manager_v1", 1);
+    scanner.generate("wp_tearing_control_manager_v1", 1);
+    scanner.generate("wp_color_manager_v1", 2);
+    scanner.generate("wp_color_representation_manager_v1", 1);
 
-    scanner.generate("river_window_manager_v1", 3);
+    scanner.generate("river_window_manager_v1", 4);
     scanner.generate("river_xkb_bindings_v1", 2);
     scanner.generate("river_layer_shell_v1", 1);
     scanner.generate("river_input_manager_v1", 1);
@@ -121,6 +128,7 @@ pub fn build(b: *Build) !void {
 
     scanner.generate("zwlr_output_power_manager_v1", 1);
     scanner.generate("zwlr_layer_shell_v1", 4);
+    scanner.generate("zwp_virtual_keyboard_manager_v1", 1);
 
     const wayland = b.createModule(.{ .root_source_file = scanner.result });
 
@@ -136,12 +144,20 @@ pub fn build(b: *Build) !void {
     // exposed to the wlroots module for @cImport() to work. This seems to be
     // the best way to do so with the current std.Build API.
     wlroots.resolved_target = target;
-    const wlroots_pkgconf = "wlroots-0.19";
+    const wlroots_pkgconf = "wlroots-0.20";
     wlroots.linkSystemLibrary(wlroots_pkgconf, .{});
 
     const flags = b.createModule(.{ .root_source_file = b.path("common/flags.zig") });
     const slotmap = b.createModule(.{ .root_source_file = b.path("common/slotmap.zig") });
-    const deque = b.createModule(.{ .root_source_file = b.path("common/deque.zig") });
+
+    const translate_c: Translator = .init(b.dependency("translate_c", .{}), .{
+        .name = "c",
+        .c_source_file = b.path("river/c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_c.linkSystemLibrary("libevdev", .{});
+    translate_c.linkSystemLibrary("libinput", .{});
 
     {
         const river = b.addExecutable(.{
@@ -150,12 +166,13 @@ pub fn build(b: *Build) !void {
                 .root_source_file = b.path("river/main.zig"),
                 .target = target,
                 .optimize = optimize,
+
                 .strip = strip,
+                .link_libc = true,
             }),
         });
         river.root_module.addOptions("build_options", options);
 
-        river.root_module.link_libc = true;
         river.root_module.linkSystemLibrary("libevdev", .{});
         river.root_module.linkSystemLibrary("libinput", .{});
         river.root_module.linkSystemLibrary("wayland-server", .{});
@@ -169,9 +186,9 @@ pub fn build(b: *Build) !void {
         river.root_module.addImport("wlroots", wlroots);
         river.root_module.addImport("flags", flags);
         river.root_module.addImport("slotmap", slotmap);
-        river.root_module.addImport("deque", deque);
+        river.root_module.addImport("c", translate_c.mod);
 
-        river.addCSourceFile(.{
+        river.root_module.addCSourceFile(.{
             .file = b.path("river/wlroots_log_wrapper.c"),
             .flags = &.{ "-std=c99", "-O2" },
         });
@@ -215,7 +232,7 @@ pub fn build(b: *Build) !void {
             // This makes the caching work for the Workaround, and the extra argument is ignored by /bin/sh.
             scdoc.addFileArg(b.path("doc/" ++ page ++ ".1.scd"));
 
-            const stdout = scdoc.captureStdOut();
+            const stdout = scdoc.captureStdOut(.{});
             b.getInstallStep().dependOn(&b.addInstallFile(stdout, "share/man/man1/" ++ page ++ ".1").step);
         }
     }
@@ -230,17 +247,7 @@ pub fn build(b: *Build) !void {
         });
         const run_slotmap_test = b.addRunArtifact(slotmap_test);
 
-        const deque_test = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("common/deque.zig"),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        const run_deque_test = b.addRunArtifact(deque_test);
-
         const test_step = b.step("test", "Run the tests");
         test_step.dependOn(&run_slotmap_test.step);
-        test_step.dependOn(&run_deque_test.step);
     }
 }
