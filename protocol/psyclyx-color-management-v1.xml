@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="psyclyx_color_management_v1">
+  <copyright>
+    SPDX-FileCopyrightText: © 2026 The River Developers
+    SPDX-License-Identifier: GPL-3.0-only
+  </copyright>
+
+  <description summary="private per-output display color correction">
+    This is a PRIVATE, non-standard protocol. The "psyclyx" namespace marks it
+    as a personal extension carried by one river fork; it is not a river or
+    Wayland standard and carries no compatibility promise. Do not implement it
+    in other compositors or clients expecting stability.
+
+    It lets a trusted client assign a display ICC profile to an individual
+    output as a color transform applied after blending, correcting the
+    composited image for that physical panel. This is display calibration/
+    output policy, deliberately kept out of the standard color-management
+    protocol (which the ecosystem routes through colord); this protocol exists
+    because river has no config surface for per-output color and no colord
+    integration.
+
+    The lifecycle mirrors wlr-gamma-control: a client takes exclusive control of
+    an output's color via a per-output object, and the correction is bound to
+    that object's lifetime. Destroying the object — or the client disconnecting —
+    reverts the output to uncorrected. Killing the controlling process is thus a
+    reliable undo.
+  </description>
+
+  <interface name="psyclyx_color_management_v1" version="1">
+    <description summary="output color management manager"/>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Destroy the manager. Any output color objects created through it are
+        unaffected and retain control of their outputs.
+      </description>
+    </request>
+
+    <request name="get_output_color">
+      <description summary="take color control of an output">
+        Create an object to control the color correction of the given output.
+
+        Only one client may control a given output's color at a time. If the
+        output is already controlled, or is otherwise unavailable (invalid, or
+        the renderer lacks output color transform support), the returned object
+        is immediately sent the failed event and is inert; the client should
+        destroy it.
+      </description>
+      <arg name="id" type="new_id" interface="psyclyx_color_management_output_v1"/>
+      <arg name="output" type="object" interface="wl_output"/>
+    </request>
+  </interface>
+
+  <interface name="psyclyx_color_management_output_v1" version="1">
+    <description summary="color control for a single output">
+      Controls the color correction of one output. The correction persists for
+      as long as this object lives; destroying it (or disconnecting) reverts the
+      output to an uncorrected (identity) transform.
+    </description>
+
+    <event name="failed">
+      <description summary="color control could not be acquired">
+        Sent at most once, if control of the output could not be acquired
+        (already controlled by another client, output invalid, or unsupported).
+        The object is inert: further requests other than destroy are ignored.
+      </description>
+    </event>
+
+    <request name="set_icc_profile">
+      <description summary="apply an ICC profile to the output">
+        Build a color transform from the ICC profile whose bytes are found in
+        the file descriptor at [offset, offset + length), and apply it to the
+        output after blending, replacing any transform previously set through
+        this object.
+
+        The fd is not retained: its contents are read synchronously and the
+        compositor closes its copy when the request returns. length must be
+        greater than zero and at most 64 MiB. A profile that cannot be read or
+        is not a usable ICC profile is ignored (and logged); no error is raised,
+        leaving whatever correction was previously in effect.
+      </description>
+      <arg name="icc_fd" type="fd" summary="file descriptor holding the ICC profile"/>
+      <arg name="offset" type="uint" summary="byte offset of the profile within the fd"/>
+      <arg name="length" type="uint" summary="length of the profile in bytes"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="release color control">
+        Revert the output to an uncorrected transform and destroy the object.
+      </description>
+    </request>
+  </interface>
+</protocol>

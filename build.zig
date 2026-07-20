@@ -93,6 +93,7 @@ pub fn build(b: *Build) !void {
     scanner.addCustomProtocol(b.path("protocol/river-input-management-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/river-libinput-config-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/river-xkb-config-v1.xml"));
+    scanner.addCustomProtocol(b.path("protocol/psyclyx-color-management-v1.xml"));
 
     scanner.addCustomProtocol(b.path("protocol/upstream/wlr-layer-shell-unstable-v1.xml"));
     scanner.addCustomProtocol(b.path("protocol/upstream/wlr-output-power-management-unstable-v1.xml"));
@@ -129,6 +130,7 @@ pub fn build(b: *Build) !void {
     scanner.generate("river_input_manager_v1", 2);
     scanner.generate("river_libinput_config_v1", 2);
     scanner.generate("river_xkb_config_v1", 2);
+    scanner.generate("psyclyx_color_management_v1", 1);
 
     scanner.generate("zwlr_output_power_manager_v1", 1);
     scanner.generate("zwlr_layer_shell_v1", 4);
@@ -202,6 +204,34 @@ pub fn build(b: *Build) !void {
         river.root_module.omit_frame_pointer = omit_frame_pointer;
 
         b.installArtifact(river);
+    }
+
+    {
+        // Companion client for the private psyclyx_color_management_v1 protocol,
+        // reusing the scanned wayland module (client bindings).
+        const set_output_icc = b.addExecutable(.{
+            .name = "set-output-icc",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("contrib/set-output-icc.zig"),
+                .target = target,
+                .optimize = optimize,
+                .strip = strip,
+                .link_libc = true,
+            }),
+            .use_llvm = use_llvm,
+            .use_lld = use_llvm,
+        });
+        set_output_icc.root_module.linkSystemLibrary("wayland-client", .{});
+        set_output_icc.root_module.addImport("wayland", wayland);
+        set_output_icc.pie = pie;
+        set_output_icc.root_module.omit_frame_pointer = omit_frame_pointer;
+
+        // Expose the client under its own step so it can be built and installed
+        // independently of the compositor (see the set-output-icc derivation).
+        // It is intentionally NOT part of the default install step, so a plain
+        // `zig build` / the river derivation produces only the compositor.
+        const step = b.step("set-output-icc", "Build and install the set-output-icc client");
+        step.dependOn(&b.addInstallArtifact(set_output_icc, .{}).step);
     }
 
     {

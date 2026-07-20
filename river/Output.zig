@@ -14,10 +14,13 @@ const wayland = @import("wayland");
 const wl = wayland.server.wl;
 const zwlr = wayland.server.zwlr;
 const river = wayland.server.river;
+const psyclyx = wayland.server.psyclyx;
 
 const server = &@import("main.zig").server;
 const util = @import("util.zig");
 
+const ColorManagement = @import("ColorManagement.zig");
+const ColorTransform = @import("ColorTransform.zig");
 const LayerShellOutput = @import("LayerShellOutput.zig");
 const LockSurface = @import("LockSurface.zig");
 const SceneNodeData = @import("SceneNodeData.zig");
@@ -139,6 +142,14 @@ scene_output: ?*wlr.SceneOutput,
 
 object: ?*river.OutputV1 = null,
 layer_shell: LayerShellOutput = .{},
+
+/// ICC-derived color correction applied by the scene after blending, or null
+/// for an uncorrected output. Owned by the Output. Set through the
+/// psyclyx_color_management_v1 protocol.
+color_transform: ?*wlr.ColorTransform = null,
+/// The protocol object currently holding exclusive color control of this
+/// output, if any (see ColorManagement).
+color_object: ?*psyclyx.ColorManagementOutputV1 = null,
 
 /// Tracks the currently presented frame on the output as it pertains to ext-session-lock.
 /// The output is initially considered blanked:
@@ -270,6 +281,12 @@ fn handleDestroy(listener: *wl.Listener(*wlr.Output), wlr_output: *wlr.Output) v
     output.frame.link.remove();
     output.present.link.remove();
 
+    ColorManagement.makeOutputInert(output);
+    if (output.color_transform) |transform| {
+        ColorTransform.unref(transform);
+        output.color_transform = null;
+    }
+
     wlr_output.data = null;
 
     output.wlr_output = null;
@@ -373,6 +390,16 @@ pub fn manageStart(output: *Output) void {
     }
 }
 
+/// Replace this output's ICC color-correction transform, taking ownership of
+/// `transform` (pass null to clear), releasing any previous one, and scheduling
+/// a frame so the change takes effect. Used by the psyclyx_color_management_v1
+/// protocol.
+pub fn setColorTransform(output: *Output, transform: ?*wlr.ColorTransform) void {
+    if (output.color_transform) |old| ColorTransform.unref(old);
+    output.color_transform = transform;
+    if (output.wlr_output) |wlr_output| wlr_output.scheduleFrame();
+}
+
 pub fn makeInert(output: *Output) void {
     if (output.object) |output_v1| {
         output_v1.sendRemoved();
@@ -467,7 +494,8 @@ fn renderAndCommit(output: *Output) !void {
 
     output.current.applyNoModeset(&state);
 
-    if (!output.scene_output.?.buildState(&state, null)) return error.CommitFailed;
+    const options: wlr.SceneOutput.StateOptions = .{ .color_transform = output.color_transform };
+    if (!output.scene_output.?.buildState(&state, &options)) return error.CommitFailed;
 
     if (output.rendering_current.tearing) {
         state.tearing_page_flip = true;

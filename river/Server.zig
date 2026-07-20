@@ -28,6 +28,7 @@ const Window = @import("Window.zig");
 const WindowManager = @import("WindowManager.zig");
 const XkbBindings = @import("XkbBindings.zig");
 const LayerShell = @import("LayerShell.zig");
+const ColorManagement = @import("ColorManagement.zig");
 const LibinputConfig = @import("LibinputConfig.zig");
 const XkbConfig = @import("XkbConfig.zig");
 const XdgDecoration = @import("XdgDecoration.zig");
@@ -101,6 +102,7 @@ lock_manager: LockManager,
 wm: WindowManager,
 xkb_bindings: XkbBindings,
 layer_shell: LayerShell,
+color_management: ColorManagement,
 
 xwayland: if (build_options.xwayland) ?*wlr.Xwayland else void = if (build_options.xwayland) null,
 new_xsurface: if (build_options.xwayland) wl.Listener(*wlr.XwaylandSurface) else void =
@@ -189,6 +191,7 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
         .wm = undefined,
         .xkb_bindings = undefined,
         .layer_shell = undefined,
+        .color_management = undefined,
     };
 
     if (renderer.getTextureFormats(@intFromEnum(wlr.BufferCap.dmabuf)) != null) {
@@ -226,6 +229,7 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
     try server.wm.init();
     try server.xkb_bindings.init();
     try server.layer_shell.init();
+    try server.color_management.init();
     try server.scene.init();
     try server.om.init();
     try server.input_manager.init();
@@ -285,6 +289,7 @@ pub fn deinit(server: *Server) void {
     server.idle_inhibit_manager.deinit();
     server.lock_manager.deinit();
     server.layer_shell.deinit();
+    server.color_management.deinit();
 
     server.wl_server.destroy();
 }
@@ -386,6 +391,7 @@ fn blocklist(server: *Server, global: *const wl.Global) bool {
         global == server.om.wlr_output_manager.global or
         global == server.om.power_manager.global or
         global == server.om.gamma_control_manager.global or
+        global == server.color_management.global or
         global == server.libinput_config.global or
         global == server.xkb_config.global or
         global == server.input_manager.global or
