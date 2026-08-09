@@ -19,7 +19,7 @@ const Seat = @import("Seat.zig");
 const log = std.log.scoped(.input);
 
 pub const Config = struct {
-    keymap: ?*xkb.Keymap,
+    keymap: *xkb.Keymap,
     /// Repeat rate in characters per second
     repeat_rate: u31 = 40,
     /// Repeat delay in milliseconds
@@ -29,6 +29,8 @@ pub const Config = struct {
 device: InputDevice,
 device_destroyed: bool = false,
 queued_events: u32 = 0,
+
+input_method: bool = false,
 
 config: Config,
 
@@ -53,11 +55,8 @@ pub fn create(seat: *Seat, wlr_device: *wlr.InputDevice, virtual: bool) !*Keyboa
         .config = .{
             .keymap = blk: {
                 if (virtual) {
-                    if (wlr_keyboard.keymap) |keymap| {
-                        break :blk keymap.ref();
-                    } else {
-                        break :blk null;
-                    }
+                    // Non-null thanks to the NoKeymapVirtKeyboard workaround.
+                    break :blk wlr_keyboard.keymap.?.ref();
                 } else {
                     break :blk server.xkb_config.default_keymap.ref();
                 }
@@ -65,7 +64,7 @@ pub fn create(seat: *Seat, wlr_device: *wlr.InputDevice, virtual: bool) !*Keyboa
         },
         .device = undefined,
     };
-    errdefer if (keyboard.config.keymap) |keymap| keymap.unref();
+    errdefer keyboard.config.keymap.unref();
 
     try keyboard.pressed.ensureTotalCapacity(util.gpa, KeyboardGroup.pressed_count_max);
     errdefer keyboard.pressed.deinit(util.gpa);
@@ -122,7 +121,12 @@ pub fn setGroup(keyboard: *Keyboard) void {
             }
         }
     }
-    keyboard.group = KeyboardGroup.create(seat, keyboard.config, keyboard.device.virtual) catch |err| switch (err) {
+    const input_method = keyboard.device.virtual and blk: {
+        const vkb = keyboard.device.wlr_device.getVirtualKeyboard().?;
+        const input_method = keyboard.device.seat.relay.input_method orelse break :blk false;
+        break :blk vkb.resource.getClient() == input_method.resource.getClient();
+    };
+    keyboard.group = KeyboardGroup.create(seat, keyboard.config, input_method) catch |err| switch (err) {
         error.OutOfMemory => {
             log.err("out of memory", .{});
             return;
@@ -146,7 +150,7 @@ pub fn setKeymap(keyboard: *Keyboard, keymap: *xkb.Keymap) void {
     if (shouldSetKeymap()) {
         _ = keyboard.device.wlr_device.toKeyboard().setKeymap(keyboard.config.keymap);
     }
-    if (keyboard.config.keymap) |old| old.unref();
+    keyboard.config.keymap.unref();
     keyboard.config.keymap = keymap.ref();
     if (keyboard.group) |group| {
         group.unref(keyboard.pressed.keys());
@@ -173,7 +177,7 @@ fn maybeDestroy(keyboard: *Keyboard) void {
         return;
     }
 
-    if (keyboard.config.keymap) |keymap| keymap.unref();
+    keyboard.config.keymap.unref();
     if (keyboard.group) |group| group.unref(keyboard.pressed.keys());
 
     keyboard.pressed.deinit(util.gpa);
@@ -212,6 +216,13 @@ pub fn processKeymap(keyboard: *Keyboard, keymap: *xkb.Keymap) void {
 fn queueKey(listener: *wl.Listener(*wlr.Keyboard.event.Key), event: *wlr.Keyboard.event.Key) void {
     const keyboard: *Keyboard = @fieldParentPtr("key", listener);
     assert(!keyboard.device_destroyed);
+
+    if (keyboard.group) |group| {
+        if (group.processKeyBuiltin(event)) {
+            return;
+        }
+    }
+
     keyboard.queued_events += 1;
     keyboard.device.seat.queueEvent(.{ .keyboard_key = .{
         .keyboard = keyboard,
@@ -225,6 +236,9 @@ fn queueModifiers(listener: *wl.Listener(*wlr.Keyboard), _: *wlr.Keyboard) void 
     const keyboard: *Keyboard = @fieldParentPtr("modifiers", listener);
     assert(!keyboard.device_destroyed);
     const wlr_keyboard = keyboard.device.wlr_device.toKeyboard();
+    if (keyboard.group) |group| {
+        group.processModifiersBuiltin(wlr_keyboard.modifiers);
+    }
     keyboard.queued_events += 1;
     keyboard.device.seat.queueEvent(.{ .keyboard_modifiers = .{
         .keyboard = keyboard,

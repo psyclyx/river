@@ -136,23 +136,18 @@ fn handleUnmap(listener: *wl.Listener(void)) void {
         }
     }
 
-    // wlr_layer_surface.output is null when the layer surface is unmapped due
-    // to the output being destroyed.
-    if (layer_surface.wlr_layer_surface.output) |wlr_output| {
-        // Beware: it is possible for arrange() to destroy this LayerSurface!
-        const output: *Output = @ptrCast(@alignCast(wlr_output.data));
-        output.layer_shell.arrange();
-        server.layer_shell.checkExclusiveFocus();
-        server.wm.dirtyWindowing();
-    }
+    // Beware: it is possible for arrange() to destroy this LayerSurface!
+    const output: *Output = @ptrCast(@alignCast(layer_surface.wlr_layer_surface.output.?.data));
+    output.layer_shell.arrange();
+    server.layer_shell.checkExclusiveFocus();
+    server.wm.dirtyWindowing();
 }
 
 fn handleCommit(listener: *wl.Listener(*wlr.Surface), _: *wlr.Surface) void {
     const layer_surface: *LayerSurface = @fieldParentPtr("commit", listener);
     const wlr_layer_surface = layer_surface.wlr_layer_surface;
 
-    // Output is being destroyed, see LayerShell.destroySurfaces()
-    if (wlr_layer_surface.output == null) return;
+    assert(wlr_layer_surface.output != null);
 
     // If the layer was changed, move the LayerSurface to the proper tree.
     if (wlr_layer_surface.current.committed.layer) {

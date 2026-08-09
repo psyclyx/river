@@ -20,8 +20,6 @@ const InputDevice = @import("InputDevice.zig");
 const log = std.log.scoped(.input);
 
 const KeyConsumer = union(enum) {
-    /// Builtin compositor binding, e.g. VT switching
-    builtin,
     /// A null value indicates that the xkb_binding_v1 was destroyed or that
     /// a press event was already sent due to a press on a different keyboard.
     binding: ?*XkbBinding,
@@ -35,6 +33,11 @@ const KeyConsumer = union(enum) {
 
 const Press = struct {
     consumer: KeyConsumer,
+    count: u32,
+};
+
+const BuiltinPress = struct {
+    consumed: bool,
     count: u32,
 };
 
@@ -56,7 +59,8 @@ seat: *Seat,
 /// Seat.keyboard_groups
 link: wl.list.Link,
 
-virtual: bool,
+/// If this is the group for a virtual keyboard created by the input method client.
+input_method: bool,
 
 config: Keyboard.Config,
 
@@ -69,29 +73,38 @@ modifiers_old: wlr.Keyboard.ModifierMask = .{},
 /// about where the press event has been sent.
 pressed: std.AutoArrayHashMapUnmanaged(u32, Press) = .empty,
 
+/// State for builtin compositor bindings, e.g. VT switching
+builtin_state: *xkb.State,
+/// Map from pressed xkb keycode to corresponding data.
+builtin_pressed: std.AutoArrayHashMapUnmanaged(u32, BuiltinPress) = .empty,
+
 key: wl.Listener(*wlr.Keyboard.event.Key) = .init(handleKey),
 modifiers: wl.Listener(*wlr.Keyboard) = .init(handleModifiers),
 
-pub fn create(seat: *Seat, config: Keyboard.Config, virtual: bool) !*KeyboardGroup {
+pub fn create(seat: *Seat, config: Keyboard.Config, input_method: bool) !*KeyboardGroup {
     const group = try util.gpa.create(KeyboardGroup);
     errdefer util.gpa.destroy(group);
     group.* = .{
         .seat = seat,
-        .virtual = virtual,
+        .input_method = input_method,
         .config = config,
         .state = undefined,
+        .builtin_state = xkb.State.new(config.keymap) orelse return error.OutOfMemory,
         .link = undefined,
     };
+    errdefer group.builtin_state.unref();
 
     try group.pressed.ensureTotalCapacity(util.gpa, pressed_count_max);
+    errdefer group.pressed.deinit(util.gpa);
+    try group.builtin_pressed.ensureTotalCapacity(util.gpa, pressed_count_max);
     errdefer comptime unreachable;
 
     seat.keyboard_groups.append(group);
 
     group.state.init(&.{
-        .name = "river.KeyboardGroup",
+        .name = "river.KeyboardGroup.state",
         .led_update = ledUpdate,
-    }, "river.KeyboardGroup");
+    }, "river.KeyboardGroup.state");
     group.state.data = group;
 
     // wlroots will log an error on failure, there's not much we can do to recover unfortunately.
@@ -140,6 +153,7 @@ pub fn unref(group: *KeyboardGroup, to_release: []u32) void {
     }
 
     group.state.finish();
+    group.builtin_state.unref();
 
     group.pressed.deinit(util.gpa);
 
@@ -153,13 +167,12 @@ pub fn match(group: *const KeyboardGroup, config: *Keyboard.Config) bool {
     if (a.repeat_delay != b.repeat_delay) return false;
 
     if (a.keymap == b.keymap) return true;
-    if (a.keymap == null or b.keymap == null) return false;
 
     // Can't get away with a cheap pointer comparison.
     // TODO implement a non-terrible way to do this upstream in xkbcommon
-    const a_string = a.keymap.?.getAsString2(.use_original_format, .{});
+    const a_string = a.keymap.getAsString2(.use_original_format, .{});
     defer std.c.free(a_string);
-    const b_string = b.keymap.?.getAsString2(.use_original_format, .{});
+    const b_string = b.keymap.getAsString2(.use_original_format, .{});
     defer std.c.free(b_string);
     if (a_string == null or b_string == null) {
         // Ugh, no good options here, we don't know why the function failed.
@@ -169,11 +182,49 @@ pub fn match(group: *const KeyboardGroup, config: *Keyboard.Config) bool {
     }
     if (std.mem.orderZ(u8, a_string.?, b_string.?) == .eq) {
         // Consolidate so we don't have to do this expensive/silly comparison again
-        config.keymap.?.unref();
-        config.keymap = group.config.keymap.?.ref();
+        config.keymap.unref();
+        config.keymap = group.config.keymap.ref();
         return true;
     }
     return false;
+}
+
+pub fn processKeyBuiltin(group: *KeyboardGroup, event: *const wlr.Keyboard.event.Key) bool {
+    const xkb_keycode = event.keycode + 8;
+    if (group.builtin_pressed.getPtr(xkb_keycode)) |key| {
+        assert(key.count > 0);
+        const consumed = key.consumed;
+        if (event.state == .pressed) {
+            key.count += 1;
+        } else {
+            key.count -= 1;
+            if (key.count == 0) {
+                assert(group.builtin_pressed.swapRemove(xkb_keycode));
+                if (event.update_state) {
+                    _ = group.builtin_state.updateKey(xkb_keycode, .up);
+                }
+            }
+        }
+        return consumed;
+    } else if (event.state == .pressed) {
+        if (group.builtin_pressed.count() < pressed_count_max) {
+            const consumed = group.matchBuiltinBinding(xkb_keycode);
+            group.builtin_pressed.putAssumeCapacityNoClobber(xkb_keycode, .{
+                .consumed = consumed,
+                .count = 1,
+            });
+            if (event.update_state) {
+                _ = group.builtin_state.updateKey(xkb_keycode, .down);
+            }
+            return consumed;
+        }
+    }
+    // Release events without a prior press event are ignored.
+    return false;
+}
+
+pub fn processModifiersBuiltin(group: *KeyboardGroup, mods: wlr.Keyboard.Modifiers) void {
+    _ = group.builtin_state.updateMask(mods.depressed, mods.latched, mods.locked, 0, 0, mods.group);
 }
 
 pub fn processKey(group: *KeyboardGroup, event: *const wlr.Keyboard.event.Key) void {
@@ -241,12 +292,6 @@ fn handleKey(listener: *wl.Listener(*wlr.Keyboard.event.Key), event: *wlr.Keyboa
         // Translate libinput keycode -> xkbcommon
         const xkb_keycode = event.keycode + 8;
         const modifiers = group.state.getModifiers();
-        for (xkb_state.keyGetSyms(xkb_keycode)) |sym| {
-            if (handleBuiltinBinding(sym)) {
-                log.debug("matched builtin binding", .{});
-                break :blk .builtin;
-            }
-        }
         if (group.seat.matchXkbBinding(xkb_keycode, modifiers, xkb_state)) |binding| {
             log.debug("matched xkb binding", .{});
             group.seat.xkb_bindings_seat.ensure_next_key_eaten = false;
@@ -284,7 +329,6 @@ fn handleKey(listener: *wl.Listener(*wlr.Keyboard.event.Key), event: *wlr.Keyboa
     }
 
     switch (consumer) {
-        .builtin => {},
         .binding => |b| if (b) |binding| {
             if (event.state == .pressed) {
                 binding.pressed();
@@ -362,7 +406,7 @@ pub fn processModifiers(group: *KeyboardGroup, modifiers: wlr.Keyboard.Modifiers
 fn handleModifiers(listener: *wl.Listener(*wlr.Keyboard), _: *wlr.Keyboard) void {
     const group: *KeyboardGroup = @fieldParentPtr("modifiers", listener);
 
-    {
+    if (!group.input_method) {
         const old: u32 = @bitCast(group.modifiers_old);
         const new: u32 = @bitCast(group.state.getModifiers());
         const watched: u32 = @bitCast(group.seat.xkb_bindings_seat.requested.mods_watched);
@@ -386,30 +430,35 @@ fn handleModifiers(listener: *wl.Listener(*wlr.Keyboard), _: *wlr.Keyboard) void
     group.sendState();
 }
 
-/// Handle any builtin, hardcoded compositor keybindings such as VT switching.
-/// Returns true if the keysym was handled.
-fn handleBuiltinBinding(keysym: xkb.Keysym) bool {
-    switch (@intFromEnum(keysym)) {
-        @intFromEnum(xkb.Keysym.XF86Switch_VT_1)...@intFromEnum(xkb.Keysym.XF86Switch_VT_12) => {
-            log.debug("switch VT keysym received", .{});
-            if (server.session) |session| {
-                const vt = @intFromEnum(keysym) - @intFromEnum(xkb.Keysym.XF86Switch_VT_1) + 1;
-                std.log.info("switching to VT {}", .{vt});
-                session.changeVt(vt) catch std.log.err("changing VT failed", .{});
-            }
-            return true;
-        },
-        else => return false,
+/// Check if a builtin, hardcoded compositor keybinding matches.
+/// Returns true if the key press was consumed.
+fn matchBuiltinBinding(group: *KeyboardGroup, xkb_keycode: u32) bool {
+    for (group.builtin_state.keyGetSyms(xkb_keycode)) |keysym| {
+        switch (@intFromEnum(keysym)) {
+            @intFromEnum(xkb.Keysym.XF86Switch_VT_1)...@intFromEnum(xkb.Keysym.XF86Switch_VT_12) => {
+                log.debug("switch VT keysym received", .{});
+                if (server.session) |session| {
+                    const vt = @intFromEnum(keysym) - @intFromEnum(xkb.Keysym.XF86Switch_VT_1) + 1;
+                    std.log.info("switching to VT {}", .{vt});
+                    session.changeVt(vt) catch std.log.err("changing VT failed", .{});
+                }
+                return true;
+            },
+            else => {},
+        }
     }
+    return false;
+}
+
+fn inputMethodKeyboard(group: *KeyboardGroup) bool {
+    if (group.virtual) {}
+    return false;
 }
 
 /// Returns null if the keyboard is not grabbed by an input method,
-/// or if the group is for a virtual keyboard.
-/// TODO: it would be good if virtual keyboards that are not associated with the
-/// input method client would pass through the input method grab.
-/// See https://gitlab.freedesktop.org/wlroots/wlroots/-/issues/2322
+/// or if the group is for a virtual keyboard created by the input method.
 fn getInputMethodGrab(group: *KeyboardGroup) ?*wlr.InputMethodV2.KeyboardGrab {
-    if (group.virtual) {
+    if (group.input_method) {
         return null;
     }
     if (group.seat.relay.input_method) |input_method| {
@@ -426,7 +475,7 @@ pub fn processKeymap(group: *KeyboardGroup, keymap: *xkb.Keymap) void {
 }
 
 pub fn sendState(group: *KeyboardGroup) void {
-    const keymap = group.config.keymap.?;
+    const keymap = group.config.keymap;
     const layout_index = group.state.modifiers.group;
     const layout_name = keymap.layoutGetName(layout_index);
     const caps_mask = keymap.modGetMask(xkb.names.mod.caps);
