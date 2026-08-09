@@ -13,6 +13,9 @@ const wayland = @import("wayland");
 const wl = wayland.server.wl;
 const wp = wayland.server.wp;
 
+// Supplements zig-wlroots, which does not bind the KDE server-decoration protocol.
+const ServerDecorationManager = @import("wlr_server_decoration.zig").ServerDecorationManager;
+
 const util = @import("util.zig");
 
 const IdleInhibitManager = @import("IdleInhibitManager.zig");
@@ -70,6 +73,7 @@ cursor_shape_manager: *wlr.CursorShapeManagerV1,
 
 xdg_shell: *wlr.XdgShell,
 xdg_decoration_manager: *wlr.XdgDecorationManagerV1,
+server_decoration_manager: *ServerDecorationManager,
 xdg_activation: *wlr.XdgActivationV1,
 xdg_foreign_registry: *wlr.XdgForeignRegistry,
 xdg_foreign_v2: *wlr.XdgForeignV2,
@@ -158,6 +162,7 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
 
         .xdg_shell = try wlr.XdgShell.create(wl_server, 5),
         .xdg_decoration_manager = try wlr.XdgDecorationManagerV1.create(wl_server),
+        .server_decoration_manager = try ServerDecorationManager.create(wl_server),
         .xdg_activation = try wlr.XdgActivationV1.create(wl_server),
         .xdg_foreign_registry = xdg_foreign_registry,
         .xdg_foreign_v2 = try wlr.XdgForeignV2.create(wl_server, xdg_foreign_registry),
@@ -190,6 +195,11 @@ pub fn init(server: *Server, runtime_xwayland: bool) !void {
         .xkb_bindings = undefined,
         .layer_shell = undefined,
     };
+
+    // Advertise server-side decorations as the default for clients that
+    // speak the KDE server-decoration protocol (e.g. GTK apps), so they
+    // don't draw their own client-side decorations.
+    server.server_decoration_manager.setDefaultMode(.server);
 
     if (renderer.getTextureFormats(@intFromEnum(wlr.BufferCap.dmabuf)) != null) {
         server.linux_dmabuf = try wlr.LinuxDmabufV1.createWithRenderer(wl_server, 5, renderer);
@@ -351,6 +361,7 @@ fn allowlist(server: *Server, global: *const wl.Global) bool {
         global == server.cursor_shape_manager.global or
         global == server.xdg_shell.global or
         global == server.xdg_decoration_manager.global or
+        global == server.server_decoration_manager.global or
         global == server.xdg_activation.global or
         global == server.xdg_foreign_v2.exporter.global or
         global == server.xdg_foreign_v2.importer.global or
