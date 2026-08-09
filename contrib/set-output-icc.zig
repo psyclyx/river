@@ -23,6 +23,13 @@ const io = std.Io.Threaded.global_single_threaded.io();
 /// Reject absurd ICC sizes; matches the compositor-side limit.
 const max_icc_bytes = 64 << 20;
 
+/// Exit status for failures that won't resolve within this session — compositor
+/// lacks the protocol, the output is absent, control was denied, or the profile
+/// is unreadable. The systemd unit maps this to RestartPreventExitStatus so the
+/// service doesn't retry it. Transient failures (e.g. can't connect to Wayland
+/// yet) instead exit via the normal error path (status 1) and are retried.
+const exit_unretryable: u8 = 2;
+
 const OutputInfo = struct {
     proxy: *wl.Output,
     name: ?[]u8 = null,
@@ -109,14 +116,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const manager = state.manager orelse {
         std.debug.print("psyclyx_color_management_v1 not available (is this a patched river?)\n", .{});
-        std.process.exit(1);
+        std.process.exit(exit_unretryable);
     };
     const target = state.target orelse {
         std.debug.print("output '{s}' not found; available:\n", .{state.target_name.?});
         for (state.outputs[0..state.output_count]) |o| {
             std.debug.print("  {s}\n", .{o.name orelse "(unnamed)"});
         }
-        std.process.exit(1);
+        std.process.exit(exit_unretryable);
     };
 
     // Keep the file open for the life of the process; libwayland dups the fd at
@@ -124,15 +131,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const path = args[2];
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
         std.debug.print("cannot open ICC profile '{s}': {s}\n", .{ path, @errorName(err) });
-        std.process.exit(1);
+        std.process.exit(exit_unretryable);
     };
     const stat = file.stat(io) catch |err| {
         std.debug.print("cannot stat ICC profile '{s}': {s}\n", .{ path, @errorName(err) });
-        std.process.exit(1);
+        std.process.exit(exit_unretryable);
     };
     if (stat.size == 0 or stat.size > max_icc_bytes) {
         std.debug.print("ICC profile '{s}' has bad size {d}\n", .{ path, stat.size });
-        std.process.exit(1);
+        std.process.exit(exit_unretryable);
     }
 
     const color = try manager.getOutputColor(target);
@@ -182,7 +189,7 @@ fn colorListener(
         .failed => {
             std.debug.print("failed: could not take color control of the output " ++
                 "(already controlled by another client, or unsupported)\n", .{});
-            std.process.exit(1);
+            std.process.exit(exit_unretryable);
         },
     }
 }
