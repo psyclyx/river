@@ -1,0 +1,11 @@
+--- a/render/color_lcms2.c
++++ b/render/color_lcms2.c
+@@ -68,7 +68,7 @@
+ 
+ 	cmsHTRANSFORM lcms_tr = cmsCreateTransformTHR(ctx,
+ 		srgb_profile, TYPE_RGB_FLT, icc_profile, TYPE_RGB_FLT,
+-		INTENT_RELATIVE_COLORIMETRIC, 0);
++		INTENT_RELATIVE_COLORIMETRIC, cmsFLAGS_BLACKPOINTCOMPENSATION);
+ 	cmsCloseProfile(srgb_profile);
+ 	cmsCloseProfile(icc_profile);
+ 	if (lcms_tr == NULL) {
