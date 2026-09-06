@@ -449,12 +449,6 @@ fn renderFinish(wm: *WindowManager) void {
     {
         var it = wm.windows.iterator();
         while (it.next()) |window| {
-            // If a window is unmapped during a render sequence, we need to retain the saved
-            // buffers until after the next manage sequence (in which the closed event will
-            // be sent) for frame perfection.
-            if (window.state != .closing) {
-                window.surfaces.dropSaved();
-            }
             // Ensure windows that are closed but not yet destroyed don't have
             // their borders/decorations rendered.
             if (window.state == .init) {
@@ -523,6 +517,25 @@ fn renderFinish(wm: *WindowManager) void {
                     }
                     shell_surface.tree.node.raiseToTop();
                 },
+            }
+        }
+    }
+
+    {
+        var it = wm.windows.iterator();
+        while (it.next()) |window| {
+            // Drop the saved surfaces only after renderFinish() has applied all changes.
+            // Dropping before renderFinish() temporarily places the new buffer at the
+            // old position, causing wlr_scene to send unwanted output enter/leave and
+            // scale events for the intermediate state that will never actually be rendered.
+            //
+            // TODO(wlroots) provide a way to batch changes to the scene graph.
+            //
+            // If a window is unmapped during a render sequence, we need to retain the saved
+            // buffers until after the next manage sequence (in which the closed event will
+            // be sent) for frame perfection.
+            if (window.state != .closing) {
+                window.surfaces.dropSaved();
             }
         }
     }

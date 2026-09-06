@@ -927,15 +927,13 @@ fn presentationHint(window: *Window) river.OutputV1.PresentationMode {
 pub fn renderFinish(window: *Window) void {
     const requested = &window.rendering_requested;
 
-    // Keep the scene nodes disabled until the render sequence in which the first
-    // dimensions event was sent is completed. If we enable the nodes before the
-    // window is mapped, there may be an imperfect frame rendered after the window
-    // commits its initial buffer and before the render sequence with the first
-    // dimensions event is completed.
-    // Keeping the nodes enabled while closing is necessary for frame perfection.
-    const enabled = !requested.hidden and (window.state == .mapped or window.state == .closing);
-    window.tree.node.setEnabled(enabled);
-    window.popup_tree.node.setEnabled(enabled);
+    // Disable the scene nodes to avoid temporary, intermediate wlroots scene
+    // graph states that may cause wlroots to send unwanted output enter/leave
+    // scale events for a temporary state that will never be rendered.
+    //
+    // TODO(wlroots) provide a way to batch changes to the scene graph.
+    window.tree.node.setEnabled(false);
+    window.popup_tree.node.setEnabled(false);
 
     window.box.width = window.rendering_sent.width;
     window.box.height = window.rendering_sent.height;
@@ -974,6 +972,16 @@ pub fn renderFinish(window: *Window) void {
             decoration.renderFinish(&clip);
         }
     }
+
+    // Keep the scene nodes disabled until the render sequence in which the first
+    // dimensions event was sent is completed. If we enable the nodes before the
+    // window is mapped, there may be an imperfect frame rendered after the window
+    // commits its initial buffer and before the render sequence with the first
+    // dimensions event is completed.
+    // Keeping the nodes enabled while closing is necessary for frame perfection.
+    const enabled = !requested.hidden and (window.state == .mapped or window.state == .closing);
+    window.tree.node.setEnabled(enabled);
+    window.popup_tree.node.setEnabled(enabled);
 }
 
 fn drawBorders(window: *Window) void {
