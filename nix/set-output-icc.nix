@@ -26,7 +26,23 @@ stdenv.mkDerivation {
   pname = "set-output-icc";
   version = "0.1.0";
 
-  src = lib.cleanSource ../.;
+  # Same fileset as river's (minus the man page, which this build never
+  # runs): build.zig's build() evaluates the whole graph — the scanner's
+  # protocol XMLs and the compositor module's translate-c declarations are
+  # all real configure-time inputs — so the shared tree (common/, river/,
+  # contrib/, protocol/) is the client's genuine input surface too. Entry
+  # points and npins/ are not, so editing them must not churn the hash.
+  src = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../build.zig
+      ../build.zig.zon
+      ../common
+      ../contrib
+      ../protocol
+      ../river
+    ];
+  };
 
   nativeBuildInputs = [
     pkg-config
