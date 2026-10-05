@@ -4,11 +4,11 @@
 
 linkFarm "zig-packages" [
   {
-    name = "aro-0.0.0-JSD1Qi7QNgDnfcrdEJf82v3o6MhZySjYVrtdfEf3E4Se";
+    name = "aro-0.0.0-JSD1QmbSNgDrBkBPRoDPwy1rN1ABGBa7B1NzC-lqnGxw";
     path = fetchgit {
-      url = "https://github.com/Vexu/arocc";
-      rev = "5f5a050569a95ecc40a426f0c3666ae7ef987ede";
-      hash = "sha256-f8Z0SXWx5Uia2TCMB5SUpcO8+xUnaWk32Oknva7xcxw=";
+      url = "https://codeberg.org/ifreund/arocc";
+      rev = "1bf978f1e63d4fe66a90b6637ba709e9abc3c854";
+      hash = "sha256-UjLpDXeD5supXFUpa4+q9Uc9aTVglZrIp6pM1qyv1+A=";
     };
   }
   {
@@ -19,11 +19,11 @@ linkFarm "zig-packages" [
     };
   }
   {
-    name = "translate_c-0.0.0-Q_BUWlX1BgCD1wo6uo97prlp9VJ4gxAjwN_vZ7nsSjGN";
+    name = "translate_c-0.0.0-Q_BUWlL1BgD7PmL27vTsccyNCOvKb-B65O5Ki1ZKm-ED";
     path = fetchgit {
-      url = "https://codeberg.org/ziglang/translate-c/";
-      rev = "57c559cf581b1fcad90494eda219f98abeb155ce";
-      hash = "sha256-7OlW2f5tRc1UZySDcEQERsLGChSxIcJAiVWdvuFUvvY=";
+      url = "https://codeberg.org/ifreund/translate-c";
+      rev = "64570104eeed461dc221e77574cd3f1c5b7eb974";
+      hash = "sha256-ZQnT0XeVxcs5Px1Y8pNvqUOXzj0UnVC+Ijnr5ePvF/M=";
     };
   }
   {
