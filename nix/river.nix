@@ -28,8 +28,7 @@ stdenv.mkDerivation (finalAttrs: {
   # Only the files the zig build consumes: the build graph (build.zig +
   # zon), the shared modules (common/), the compositor (river/), the
   # protocols (scanned and installed), the contrib files (the desktop
-  # entry installed by postInstall and the companion client), and the
-  # scdoc man page. Entry points (default.nix, overlay.nix, nix/), npins/,
+  # entry installed by postInstall), and the scdoc man page. Entry points (default.nix, overlay.nix, nix/), npins/,
   # and docs are not package inputs, so editing them must not churn the
   # source hash.
   src = lib.fileset.toSource {
